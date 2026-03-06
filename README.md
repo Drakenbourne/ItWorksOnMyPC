@@ -44,3 +44,5 @@ ItWorksOnMyPC/
 
 - First run downloads model weights, so startup may take longer.
 - CPU execution is supported; GPU is optional.
+
+- https://aiinterviewprep.streamlit.app/
