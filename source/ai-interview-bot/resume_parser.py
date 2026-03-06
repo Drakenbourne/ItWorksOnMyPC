@@ -24,6 +24,10 @@ def _pipeline_device() -> int:
 
 @lru_cache(maxsize=1)
 def _get_skill_extractor():
+    """
+    Load HF zero-shot model when available.
+    In constrained environments (e.g. Streamlit Cloud), this may fail and we fallback.
+    """
     return pipeline(
         task="zero-shot-classification",
         model="facebook/bart-large-mnli",
@@ -32,7 +36,11 @@ def _get_skill_extractor():
 
 
 def warmup_skill_extractor() -> None:
-    _get_skill_extractor()
+    """Best-effort warmup; do not crash app startup if model load fails."""
+    try:
+        _get_skill_extractor()
+    except Exception:
+        pass
 
 
 def extract_text_from_pdf(uploaded_file) -> str:
@@ -45,20 +53,31 @@ def _compact_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _keyword_skill_extract(cleaned_text: str, top_k: int) -> List[str]:
+    lowered = cleaned_text.lower()
+    hits = [skill for skill in KNOWN_SKILLS if skill.lower() in lowered]
+    return hits[:top_k]
+
+
 def extract_skills(resume_text: str, threshold: float = 0.45, top_k: int = 12) -> List[str]:
     cleaned_text = _compact_whitespace(resume_text)
     if not cleaned_text:
         return []
 
     sample_text = cleaned_text[:2500]
-    classifier = _get_skill_extractor()
-    result = classifier(sample_text, candidate_labels=KNOWN_SKILLS, multi_label=True)
 
-    pairs = sorted(zip(result["labels"], result["scores"]), key=lambda x: x[1], reverse=True)
-    selected = [label for label, score in pairs if score >= threshold][:top_k]
+    # Try transformer-based extraction first.
+    try:
+        classifier = _get_skill_extractor()
+        result = classifier(sample_text, candidate_labels=KNOWN_SKILLS, multi_label=True)
+        pairs = sorted(zip(result["labels"], result["scores"]), key=lambda x: x[1], reverse=True)
+        selected = [label for label, score in pairs if score >= threshold][:top_k]
+        if selected:
+            return selected
+    except Exception:
+        # Intentionally fallback below.
+        pass
 
-    if not selected:
-        lowered = cleaned_text.lower()
-        selected = [skill for skill in KNOWN_SKILLS if skill.lower() in lowered][:top_k]
-
+    # Reliable fallback for constrained cloud runtimes.
+    selected = _keyword_skill_extract(cleaned_text, top_k=top_k)
     return selected
