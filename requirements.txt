@@ -1,1 +1,7 @@
-﻿-r source/ai-interview-bot/requirements.txt
+﻿streamlit==1.38.0
+pypdf==4.3.1
+numpy==1.26.4
+torch==2.2.2
+transformers==4.41.2
+sentence-transformers==2.7.0
+faiss-cpu==1.7.4
