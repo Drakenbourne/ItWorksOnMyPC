@@ -1,0 +1,11 @@
+﻿.git
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+.venv
+venv
+.env
+_write_test.txt
+*.pdf

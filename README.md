@@ -44,5 +44,24 @@ ItWorksOnMyPC/
 
 - First run downloads model weights, so startup may take longer.
 - CPU execution is supported; GPU is optional.
-
 - https://aiinterviewprep.streamlit.app/
+
+## Deployment (Railway / Fly.io)
+
+### Railway
+1. Push this repo to GitHub.
+2. In Railway: New Project -> Deploy from GitHub Repo.
+3. Railway will use `Dockerfile` automatically.
+4. Set optional env vars if needed.
+5. Deploy and open the generated URL.
+
+### Fly.io
+1. Install Fly CLI and login: `fly auth login`
+2. From repo root run: `fly launch --no-deploy`
+3. Keep `Dockerfile` and use the included `fly.toml` (update `app` name if needed).
+4. Deploy: `fly deploy`
+5. Open app: `fly open`
+
+### Notes
+- This app is CPU by default unless host machine provides GPU.
+- If model load is slow, first boot may take longer.
