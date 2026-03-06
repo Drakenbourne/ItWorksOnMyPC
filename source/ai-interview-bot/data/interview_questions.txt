@@ -1,0 +1,100 @@
+﻿Backend Development: How do you design an idempotent REST endpoint for payment processing?
+Backend Development: What are the trade-offs between synchronous and asynchronous communication in microservices?
+Backend Development: How would you implement rate limiting for a multi-tenant API?
+Backend Development: When should you choose optimistic locking over pessimistic locking?
+Backend Development: How do database connection pools improve backend performance?
+Backend Development: How do you handle partial failures in distributed backend workflows?
+Backend Development: What is the difference between eventual consistency and strong consistency?
+Backend Development: How would you secure JWT-based authentication in a production API?
+Backend Development: What strategies do you use to avoid N+1 query problems?
+Backend Development: How do you version APIs without breaking existing clients?
+Backend Development: How would you design a retry strategy for transient backend failures?
+Backend Development: What are the pros and cons of using message queues for background jobs?
+Backend Development: How do you detect and mitigate memory leaks in backend services?
+Backend Development: How would you implement distributed tracing in a microservice system?
+Backend Development: What are common causes of deadlocks and how can you prevent them?
+Backend Development: How do you design a backend for high write throughput workloads?
+Backend Development: What is the role of circuit breakers in resilient service design?
+Backend Development: How do you handle schema migrations in zero-downtime deployments?
+Backend Development: When would you choose gRPC instead of REST for backend communication?
+Backend Development: How do you enforce authorization checks consistently across services?
+Machine Learning: How do you choose evaluation metrics for an imbalanced classification problem?
+Machine Learning: What is the bias-variance trade-off and how do you diagnose it in practice?
+Machine Learning: How would you design a feature store for a production ML platform?
+Machine Learning: What techniques help reduce overfitting in deep learning models?
+Machine Learning: How do you detect and respond to model drift in production?
+Machine Learning: What is the difference between bagging, boosting, and stacking?
+Machine Learning: How would you compare fine-tuning versus prompt engineering for LLM tasks?
+Machine Learning: What steps are involved in building a robust MLOps pipeline?
+Machine Learning: How do you handle missing values for tree-based versus linear models?
+Machine Learning: What are the trade-offs between precision and recall in fraud detection?
+Machine Learning: How do you perform hyperparameter tuning efficiently at scale?
+Machine Learning: What is the purpose of cross-validation and when can it fail?
+Machine Learning: How would you evaluate a recommendation system offline and online?
+Machine Learning: What are common causes of data leakage and how do you prevent them?
+Machine Learning: How do attention mechanisms improve sequence modeling?
+Machine Learning: How would you deploy a model with low-latency inference requirements?
+Machine Learning: What is calibration in probabilistic models and why does it matter?
+Machine Learning: How do you select features for high-dimensional datasets?
+Machine Learning: What are the trade-offs of using quantization for model serving?
+Machine Learning: How do you design guardrails to reduce hallucinations in LLM applications?
+Data Science: How do you define a clear business problem before starting analysis?
+Data Science: What is your process for exploratory data analysis on a new dataset?
+Data Science: How do you decide whether to use mean, median, or model-based imputation?
+Data Science: What checks do you perform before trusting a dashboard metric?
+Data Science: How would you detect outliers and decide whether to remove them?
+Data Science: How do you design a statistically sound A/B test?
+Data Science: What are Type I and Type II errors and how do they affect decisions?
+Data Science: How do you choose between parametric and non-parametric tests?
+Data Science: How would you explain p-values and confidence intervals to non-technical stakeholders?
+Data Science: How do you validate assumptions in linear regression models?
+Data Science: What techniques do you use for time-series forecasting with seasonality?
+Data Science: How do you handle multicollinearity in predictive models?
+Data Science: What is Simpson's paradox and why is it dangerous in analysis?
+Data Science: How do you balance interpretability and predictive performance?
+Data Science: What is the difference between correlation and causation with an example?
+Data Science: How do you build a reproducible data science workflow?
+Data Science: What are cohort analysis and retention curves used for?
+Data Science: How do you monitor KPI health and detect anomalies in real time?
+Data Science: How would you segment users for targeted product interventions?
+Data Science: How do you measure the impact of a model on business outcomes?
+System Design: How would you design a URL shortener that handles billions of redirects?
+System Design: How would you design a real-time chat system with message delivery guarantees?
+System Design: How do you design a globally distributed cache invalidation strategy?
+System Design: How would you architect a file upload service for very large media files?
+System Design: How do you choose between SQL and NoSQL for a high-scale product?
+System Design: How would you design an API gateway for authentication, routing, and throttling?
+System Design: What are key considerations when designing a multi-region deployment?
+System Design: How would you design a notification system supporting email, SMS, and push?
+System Design: How do you design a search service with ranking and typo tolerance?
+System Design: How would you build a metrics pipeline for near real-time monitoring?
+System Design: How do you approach capacity planning for unpredictable traffic spikes?
+System Design: How would you design a job scheduler for millions of background tasks?
+System Design: What are the trade-offs between monoliths and microservices at scale?
+System Design: How would you design an audit logging system for compliance and forensics?
+System Design: How do you ensure data consistency across distributed services?
+System Design: How would you design a recommendation feed with low-latency reads?
+System Design: What strategies improve availability during database failover events?
+System Design: How would you design a secure secrets management service?
+System Design: How do you design a resilient event-driven architecture?
+System Design: How would you design a payment system with exactly-once processing semantics?
+Software Engineering: How do you structure code to maximize readability and maintainability?
+Software Engineering: What is your approach to writing effective unit tests?
+Software Engineering: How do you decide when to refactor versus rewrite a legacy module?
+Software Engineering: What practices help enforce code quality in large teams?
+Software Engineering: How do you conduct a useful code review that improves design quality?
+Software Engineering: What is your strategy for debugging intermittent production bugs?
+Software Engineering: How do you design interfaces that are easy to mock and test?
+Software Engineering: What are SOLID principles and where can they be overused?
+Software Engineering: How do you manage technical debt without slowing delivery?
+Software Engineering: What are the benefits and risks of trunk-based development?
+Software Engineering: How do feature flags support safer releases?
+Software Engineering: What is your approach to incident response and postmortems?
+Software Engineering: How do you design for backward compatibility in shared libraries?
+Software Engineering: How do you evaluate trade-offs between performance and simplicity?
+Software Engineering: What is your strategy for dependency management and upgrades?
+Software Engineering: How do you ensure observability is built into new services?
+Software Engineering: How do you design resilient CI/CD pipelines for large codebases?
+Software Engineering: What are common anti-patterns in object-oriented design?
+Software Engineering: How do you estimate engineering work under uncertainty?
+Software Engineering: How do you mentor junior developers while maintaining team velocity?
