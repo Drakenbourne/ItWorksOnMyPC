@@ -3,9 +3,15 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional
 
-import faiss
+import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer
+
+try:
+    import faiss  # type: ignore
+    HAS_FAISS = True
+except Exception:
+    HAS_FAISS = False
 
 
 @dataclass
@@ -51,21 +57,39 @@ def _get_embedding_model() -> SentenceTransformer:
     return SentenceTransformer("all-MiniLM-L6-v2", device=_sbert_device())
 
 
+def _l2_normalize(arr: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(arr, axis=1, keepdims=True)
+    norm[norm == 0] = 1.0
+    return arr / norm
+
+
 class RAGEngine:
     def __init__(self, questions: List[InterviewQuestion]):
         self.questions = questions
         self._model = _get_embedding_model()
         self._index = None
+        self._embeddings = None
         self._build_index()
 
     def _build_index(self) -> None:
         corpus = [f"{q.category}. {q.text}" for q in self.questions]
         embeddings = self._model.encode(corpus, convert_to_numpy=True, show_progress_bar=False).astype("float32")
-        faiss.normalize_L2(embeddings)
+        embeddings = _l2_normalize(embeddings)
 
-        index = faiss.IndexFlatIP(embeddings.shape[1])
-        index.add(embeddings)
-        self._index = index
+        if HAS_FAISS:
+            index = faiss.IndexFlatIP(embeddings.shape[1])
+            index.add(embeddings)
+            self._index = index
+        self._embeddings = embeddings
+
+    def _search_indices(self, query_vec: np.ndarray, search_k: int) -> np.ndarray:
+        if HAS_FAISS and self._index is not None:
+            _, indices = self._index.search(query_vec, search_k)
+            return indices[0]
+
+        # Numpy fallback when FAISS is unavailable.
+        sims = np.dot(self._embeddings, query_vec[0])
+        return np.argsort(-sims)[:search_k]
 
     def retrieve_questions(
         self,
@@ -73,23 +97,23 @@ class RAGEngine:
         top_k: int = 3,
         preferred_categories: Optional[List[str]] = None,
     ) -> List[str]:
-        if self._index is None:
-            raise RuntimeError("FAISS index was not built")
+        if self._embeddings is None:
+            raise RuntimeError("Vector index was not built")
 
         cleaned_query = query.strip() or "software engineering interview"
         query_vec = self._model.encode([cleaned_query], convert_to_numpy=True).astype("float32")
-        faiss.normalize_L2(query_vec)
+        query_vec = _l2_normalize(query_vec)
 
         search_k = min(max(top_k * 6, top_k), len(self.questions))
-        _, indices = self._index.search(query_vec, search_k)
+        ranked_indices = self._search_indices(query_vec, search_k)
 
         preferred = {c.lower() for c in (preferred_categories or [])}
         primary: List[str] = []
         secondary: List[str] = []
         seen = set()
 
-        for idx in indices[0]:
-            q = self.questions[idx]
+        for idx in ranked_indices:
+            q = self.questions[int(idx)]
             key = q.text.lower()
             if key in seen:
                 continue
