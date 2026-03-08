@@ -1,0 +1,13 @@
+{
+  "name": "ai-interview-bot-puter-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Puter Gemini bridge for Streamlit evaluator",
+  "scripts": {
+    "puter:login": "node puter_login.js",
+    "puter:chat": "node puter_bridge.js"
+  },
+  "dependencies": {
+    "@heyputer/puter.js": "^2.2.11"
+  }
+}

@@ -10,7 +10,9 @@ This project is an AI-powered Interview Preparation Bot built with a Retrieval A
   - `sentence-transformers` (`all-MiniLM-L6-v2`)
   - `FAISS` vector database
 - Interactive interview mode (question by question)
-- Answer evaluation using `Qwen/Qwen2.5-0.5B-Instruct` with heavier model fallbacks (override with `EVALUATOR_MODEL`)
+- Answer evaluation with provider switch:
+  - Local Hugging Face (`Qwen/Qwen2.5-0.5B-Instruct` by default)
+  - Puter Gemini bridge (`google/gemini-2.5-flash-lite` by default)
 - Final interview score summary
 - Streamlit UI for end-to-end workflow
 - Apple Silicon Metal (`MPS`) support for PyTorch-backed models
@@ -27,6 +29,9 @@ ItWorksOnMyPC/
 │       ├── resume_parser.py
 │       ├── llm_utils.py
 │       ├── requirements.txt
+│       ├── package.json
+│       ├── puter_bridge.js
+│       ├── puter_login.js
 │       └── data/
 │           └── interview_questions.txt
 └── docs/
@@ -44,10 +49,27 @@ ItWorksOnMyPC/
 4. Start app:
    - `streamlit run app.py`
 
+## Use Gemini via Puter (Optional)
+
+Run these in `source/ai-interview-bot`:
+
+1. Install JS dependency:
+   - `npm install`
+2. Login once and copy token:
+   - `npm run puter:login`
+3. Export token + provider:
+   - `export PUTER_AUTH_TOKEN="<paste-token>"`
+   - `export EVALUATOR_PROVIDER=puter`
+4. Optional model override:
+   - `export PUTER_MODEL=google/gemini-2.5-flash-lite`
+5. Run app:
+   - `streamlit run app.py`
+
 ## Notes
 
 - First run downloads model weights, so startup may take longer.
 - On Apple Silicon Macs, models use Metal GPU (`MPS`) when available.
+- For Puter Gemini mode, RAG/embeddings still run locally; evaluator/reference generation run via Puter.
 - https://aiinterviewprep.streamlit.app/
 
 ## Deployment (Railway / Fly.io)

@@ -1,2 +1,4 @@
 ﻿__pycache__/
 *.pyc
+node_modules/
+source/ai-interview-bot/node_modules/

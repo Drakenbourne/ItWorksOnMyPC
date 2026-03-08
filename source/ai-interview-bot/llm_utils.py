@@ -1,16 +1,36 @@
 import json
 import os
 import re
+import subprocess
 from functools import lru_cache
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from transformers import pipeline
 
 from device_utils import get_device, get_pipeline_device
 
 
+DEFAULT_EVALUATOR_PROVIDER = os.getenv("EVALUATOR_PROVIDER", "local").strip().lower()
 DEFAULT_EVALUATOR_MODEL = os.getenv("EVALUATOR_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 MODEL_FALLBACKS = ["Qwen/Qwen2.5-1.5B-Instruct", "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"]
+DEFAULT_PUTER_MODEL = os.getenv("PUTER_MODEL", "google/gemini-2.5-flash-lite")
+PUTER_AUTH_TOKEN_ENV = "PUTER_AUTH_TOKEN"
+PUTER_TIMEOUT_SECONDS = int(os.getenv("PUTER_TIMEOUT_SECONDS", "120"))
+PUTER_BRIDGE_PATH = Path(__file__).with_name("puter_bridge.js")
+
+
+def get_evaluator_provider() -> str:
+    provider = DEFAULT_EVALUATOR_PROVIDER
+    if provider in {"puter", "puter-gemini", "gemini"}:
+        return "puter"
+    return "local"
+
+
+def get_evaluator_backend_label() -> str:
+    if get_evaluator_provider() == "puter":
+        return f"Puter Gemini ({DEFAULT_PUTER_MODEL})"
+    return f"Local HF ({DEFAULT_EVALUATOR_MODEL})"
 
 
 def _candidate_models() -> List[str]:
@@ -26,20 +46,25 @@ def _build_evaluator(device_arg, model_name: str):
 
 
 @lru_cache(maxsize=1)
-def _get_evaluator():
+def _get_local_evaluator_with_name() -> Tuple[Any, str]:
     models = _candidate_models()
     if get_device() == "mps":
         for model_name in models:
             try:
-                return _build_evaluator(get_pipeline_device(), model_name)
+                return _build_evaluator(get_pipeline_device(), model_name), model_name
             except Exception:
                 continue
     for model_name in models:
         try:
-            return _build_evaluator(-1, model_name)
+            return _build_evaluator(-1, model_name), model_name
         except Exception:
             continue
-    raise RuntimeError("Failed to load evaluator model.")
+    raise RuntimeError("Failed to load local evaluator model.")
+
+
+def _get_local_evaluator():
+    evaluator, _ = _get_local_evaluator_with_name()
+    return evaluator
 
 
 def _extract_generated_text(output_item: Dict[str, Any], prompt: str) -> str:
@@ -56,12 +81,12 @@ def _extract_generated_text(output_item: Dict[str, Any], prompt: str) -> str:
     return str(output_item).strip()
 
 
-def _run_chat(system_prompt: str, user_prompt: str, max_new_tokens: int) -> str:
+def _run_local_chat(system_prompt: str, user_prompt: str, max_new_tokens: int) -> str:
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    output_item = _get_evaluator()(
+    output_item = _get_local_evaluator()(
         messages,
         max_new_tokens=max_new_tokens,
         do_sample=False,
@@ -72,11 +97,95 @@ def _run_chat(system_prompt: str, user_prompt: str, max_new_tokens: int) -> str:
     return _extract_generated_text(output_item, user_prompt)
 
 
+def _extract_puter_text(raw: Any) -> str:
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, dict):
+        if isinstance(raw.get("text"), str):
+            return raw["text"].strip()
+        message = raw.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str):
+                return content.strip()
+            if isinstance(content, list):
+                chunks = []
+                for item in content:
+                    if isinstance(item, dict) and "text" in item:
+                        chunks.append(str(item["text"]))
+                    elif isinstance(item, str):
+                        chunks.append(item)
+                if chunks:
+                    return " ".join(chunks).strip()
+    return str(raw or "").strip()
+
+
+def _run_puter_chat(system_prompt: str, user_prompt: str, max_new_tokens: int) -> str:
+    if not PUTER_BRIDGE_PATH.exists():
+        raise RuntimeError(f"Puter bridge script missing: {PUTER_BRIDGE_PATH}")
+
+    auth_token = os.getenv(PUTER_AUTH_TOKEN_ENV, "").strip()
+    if not auth_token:
+        raise RuntimeError(
+            "Puter provider requires PUTER_AUTH_TOKEN. "
+            "Run `npm run puter:login` in source/ai-interview-bot and export the returned token."
+        )
+
+    payload = {
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+        "model": DEFAULT_PUTER_MODEL,
+        "max_new_tokens": max_new_tokens,
+    }
+
+    proc = subprocess.run(
+        ["node", str(PUTER_BRIDGE_PATH)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=PUTER_TIMEOUT_SECONDS,
+        check=False,
+        env={**os.environ, PUTER_AUTH_TOKEN_ENV: auth_token},
+    )
+    if proc.returncode != 0:
+        err = proc.stderr.strip() or proc.stdout.strip() or "Unknown Puter error."
+        raise RuntimeError(f"Puter chat failed: {err}")
+
+    raw_output = proc.stdout.strip()
+    if not raw_output:
+        raise RuntimeError("Puter chat failed: empty stdout.")
+
+    parsed: Optional[Dict[str, Any]] = None
+    for line in reversed([ln.strip() for ln in raw_output.splitlines() if ln.strip()]):
+        try:
+            candidate = json.loads(line)
+            if isinstance(candidate, dict):
+                parsed = candidate
+                break
+        except Exception:
+            continue
+    if parsed is None:
+        raise RuntimeError(f"Puter chat failed: invalid JSON output: {raw_output[:200]}")
+
+    text = _extract_puter_text(parsed.get("response") if "response" in parsed else parsed)
+    if not text:
+        text = _extract_puter_text(parsed)
+    if not text:
+        raise RuntimeError("Puter chat failed: empty response text.")
+    return text
+
+
+def _run_chat(system_prompt: str, user_prompt: str, max_new_tokens: int) -> str:
+    if get_evaluator_provider() == "puter":
+        return _run_puter_chat(system_prompt, user_prompt, max_new_tokens)
+    return _run_local_chat(system_prompt, user_prompt, max_new_tokens)
+
+
 def warmup_evaluator_model() -> None:
     _run_chat(
         system_prompt="You are a helpful assistant.",
         user_prompt="Reply with one word: warm.",
-        max_new_tokens=6,
+        max_new_tokens=8,
     )
 
 
@@ -106,9 +215,7 @@ def _tokenize(text: str) -> List[str]:
 def _is_low_signal_answer(answer: str) -> bool:
     tokens = _tokenize(answer)
     low_signal = {"idk", "bro", "whatever", "nothing", "no", "don't", "dont", "know", "god"}
-    if len(tokens) <= 5 and any(tok in low_signal for tok in tokens):
-        return True
-    return False
+    return len(tokens) <= 5 and any(tok in low_signal for tok in tokens)
 
 
 def _is_profane(answer: str) -> bool:
@@ -186,7 +293,7 @@ def _heuristic_score(question: str, answer: str) -> int:
 def _top_grounded_phrases(question: str, answer: str, limit: int = 2) -> List[str]:
     q_tokens = set(_tokenize(question))
     phrases = [p.strip() for p in re.split(r"[\n,;]+", answer or "") if p.strip()]
-    ranked: List[tuple[int, str]] = []
+    ranked: List[Tuple[int, str]] = []
     for phrase in phrases:
         tokens = set(_tokenize(phrase))
         overlap = len(tokens.intersection(q_tokens))
@@ -232,28 +339,108 @@ def _derive_weakness(question: str, answer: str) -> str:
     return "You should " + ", and ".join(missing[:2]) + "."
 
 
-def _final_score(question: str, answer: str, strength: str) -> int:
+def _extract_json_block(text: str) -> Optional[Dict[str, Any]]:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    raw = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.IGNORECASE | re.MULTILINE).strip()
+    candidates = [raw]
+    for match in re.finditer(r"\{[\s\S]*?\}", raw):
+        candidates.append(match.group(0))
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            continue
+    return None
+
+
+def _looks_grounded_feedback(feedback: str, question: str, answer: str) -> bool:
+    text = (feedback or "").strip().lower()
+    if not text:
+        return False
+    if "no clear technical strength" in text:
+        return True
+    f_tokens = set(_tokenize(feedback))
+    a_tokens = set(_tokenize(answer))
+    q_tokens = set(_tokenize(question))
+    return len(f_tokens.intersection(a_tokens.union(q_tokens))) >= 2
+
+
+def _evaluate_with_model(question: str, answer: str, role: str) -> Optional[Dict[str, str]]:
+    prompt = (
+        "Evaluate the candidate answer for this interview question.\n"
+        "Use only evidence present in the candidate answer. Do not invent claims.\n"
+        "Return JSON only with keys: score, strengths, improvements.\n"
+        "Rules:\n"
+        "- score: integer 1 to 10\n"
+        "- strengths: one concise sentence about what the candidate actually did well\n"
+        "- improvements: one concise sentence on what is missing or can be improved\n"
+        "- If answer is abusive/off-topic/very low-quality, set score <= 2 and reflect that clearly.\n\n"
+        f"Role: {role}\n"
+        f"Question: {question}\n"
+        f"Candidate answer: {answer}\n"
+    )
+    raw = _run_chat(
+        system_prompt="You are a strict technical interviewer and accurate grader.",
+        user_prompt=prompt,
+        max_new_tokens=220,
+    )
+    parsed = _extract_json_block(raw)
+    if not parsed:
+        return None
+    return {
+        "score": _coerce_score(parsed.get("score")),
+        "strengths": _normalize_line(parsed.get("strengths")),
+        "improvements": _normalize_line(parsed.get("improvements")),
+    }
+
+
+def _final_score(question: str, answer: str, strength: str, model_score: Optional[int] = None) -> int:
     heuristic = _heuristic_score(question, answer)
-    score = heuristic
+    score = heuristic if model_score is None else model_score
+    if model_score is not None:
+        score = max(heuristic - 2, min(heuristic + 2, model_score))
     if strength.lower().startswith("no clear technical strength"):
         score = min(score, 4)
     if _is_profane(answer):
         score = 1
+    if _is_low_signal_answer(answer):
+        score = min(score, 2)
     return max(1, min(10, score))
 
 
 def evaluate_answer(question: str, answer: str, role: str) -> Dict[str, str]:
     safe_answer = (answer or "").strip() or "No candidate answer provided."
-    _ = role  # role retained for API compatibility and future role-specific logic.
-    strength = _derive_strength(question, safe_answer)
-    weakness = _derive_weakness(question, safe_answer)
-    final_score = _final_score(question, safe_answer, strength)
 
-    return {
-        "score": final_score,
-        "strengths": _normalize_line(strength),
-        "improvements": _normalize_line(weakness),
-    }
+    heuristic_strength = _normalize_line(_derive_strength(question, safe_answer))
+    heuristic_weakness = _normalize_line(_derive_weakness(question, safe_answer))
+
+    model_eval: Optional[Dict[str, str]] = None
+    try:
+        model_eval = _evaluate_with_model(question, safe_answer, role)
+    except Exception:
+        model_eval = None
+
+    strengths = heuristic_strength
+    improvements = heuristic_weakness
+    model_score: Optional[int] = None
+
+    if model_eval:
+        maybe_strength = _normalize_line(model_eval.get("strengths", ""))
+        maybe_improvements = _normalize_line(model_eval.get("improvements", ""))
+
+        if maybe_strength and _looks_grounded_feedback(maybe_strength, question, safe_answer):
+            strengths = maybe_strength
+        if maybe_improvements and _looks_grounded_feedback(maybe_improvements, question, safe_answer):
+            improvements = maybe_improvements
+
+        model_score = _coerce_score(model_eval.get("score"))
+
+    final_score = _final_score(question, safe_answer, strengths, model_score=model_score)
+    return {"score": final_score, "strengths": strengths, "improvements": improvements}
 
 
 @lru_cache(maxsize=512)
@@ -263,11 +450,11 @@ def generate_reference_answer(question: str, role: str) -> str:
         user_prompt=(
             f"Role: {role}\n"
             f"Question: {question}\n\n"
-            "Provide the best candidate answer in 4 to 6 complete sentences.\n"
+            "Provide the best candidate answer in 5 to 7 complete sentences.\n"
             "Write in first-person interview style, technically detailed, coherent, and concise.\n"
             "Do not provide coaching tips, headings, or bullet points."
         ),
-        max_new_tokens=260,
+        max_new_tokens=340,
     )
 
     cleaned = re.sub(r"\s+", " ", answer or "").strip()
@@ -278,32 +465,32 @@ def generate_reference_answer(question: str, role: str) -> str:
     def _sentences(text: str) -> List[str]:
         return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "") if s.strip()]
 
-    if len(_sentences(cleaned)) < 4 or not cleaned.endswith((".", "!", "?")):
+    if len(_sentences(cleaned)) < 5 or not cleaned.endswith((".", "!", "?")):
         continuation = _run_chat(
             system_prompt="You are a candidate in a technical interview.",
             user_prompt=(
-                "Continue and finish this answer so it becomes 4 to 6 coherent complete sentences.\n"
+                "Continue and finish this answer so it becomes 5 to 7 coherent complete sentences.\n"
                 f"Current answer:\n{cleaned}"
             ),
-            max_new_tokens=180,
+            max_new_tokens=220,
         )
         cleaned = _normalize_line(f"{cleaned} {continuation}")
 
     sentences = _sentences(cleaned)
-    if len(sentences) < 4:
+    if len(sentences) < 5:
         rewritten = _run_chat(
             system_prompt="You are a candidate in a technical interview.",
             user_prompt=(
-                f"Write a fresh answer to this question in 4 to 6 complete coherent sentences.\nQuestion: {question}"
+                "Write a fresh direct answer as if you are the candidate speaking in an interview.\n"
+                "Return 5 to 7 complete coherent sentences only.\n"
+                f"Question: {question}"
             ),
-            max_new_tokens=220,
+            max_new_tokens=280,
         )
         cleaned = _normalize_line(rewritten)
         sentences = _sentences(cleaned)
 
-    if len(sentences) > 6:
-        sentences = sentences[:6]
-    cleaned = " ".join(sentences)
-    cleaned = _normalize_line(cleaned)
-
+    if len(sentences) > 7:
+        sentences = sentences[:7]
+    cleaned = _normalize_line(" ".join(sentences))
     return f"Model Answer: {cleaned}"

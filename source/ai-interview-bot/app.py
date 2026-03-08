@@ -5,7 +5,12 @@ from typing import List
 import streamlit as st
 
 from device_utils import get_device
-from llm_utils import evaluate_answer, generate_reference_answer, warmup_evaluator_model
+from llm_utils import (
+    evaluate_answer,
+    generate_reference_answer,
+    get_evaluator_backend_label,
+    warmup_evaluator_model,
+)
 from rag_engine import get_rag_engine, warmup_rag_system
 from resume_parser import extract_skills, extract_text_from_pdf, warmup_skill_extractor
 
@@ -70,6 +75,8 @@ for key, default in {
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
+
+evaluator_backend = get_evaluator_backend_label()
 
 
 def _render_typing(container, text: str, anim_key: str, delay: float = 0.012) -> None:
@@ -154,7 +161,7 @@ if not st.session_state.runtime_ready:
     steps = [
         ("Preparing keyword skill extraction...", warmup_skill_extractor),
         ("Loading embedding model and building FAISS index...", lambda: warmup_rag_system(str(DATA_FILE))),
-        ("Loading Qwen-0.5B answer evaluator...", warmup_evaluator_model),
+        (f"Loading evaluator backend: {evaluator_backend}...", warmup_evaluator_model),
     ]
 
     try:
@@ -176,7 +183,10 @@ runtime_device = get_device().upper()
 st.markdown(
     f"""
     <div class="hero">
-        <h2 style="margin:0;">AI Interview Preparation Bot <span class="runtime-chip">Runtime: {runtime_device}</span></h2>
+        <h2 style="margin:0;">AI Interview Preparation Bot
+            <span class="runtime-chip">Runtime: {runtime_device}</span>
+            <span class="runtime-chip">Evaluator: {evaluator_backend}</span>
+        </h2>
         <p style="margin:0.4rem 0 0 0;">Hackathon demo: Resume-aware skill extraction + role-aware RAG + AI answer evaluation</p>
     </div>
     """,
@@ -267,7 +277,9 @@ with right_col:
             if st.button("Submit Answer", use_container_width=True):
                 st.session_state.answers[idx] = st.session_state.current_answer_input
                 question_key = f"{selected_role}::{questions[idx]}"
-                with st.spinner("AI interviewer reviewing your answer and preparing reference... (first run may load model)"):
+                with st.spinner(
+                    f"AI interviewer reviewing your answer and preparing reference via {evaluator_backend}..."
+                ):
                     evaluation = evaluate_answer(questions[idx], st.session_state.current_answer_input, selected_role)
                     st.session_state.reference_cache[question_key] = generate_reference_answer(questions[idx], selected_role)
                 st.session_state.evaluations[idx] = evaluation
