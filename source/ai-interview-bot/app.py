@@ -5,7 +5,7 @@ from typing import List
 import streamlit as st
 
 from device_utils import get_device
-from llm_utils import evaluate_answer, warmup_evaluator_model
+from llm_utils import evaluate_answer, generate_reference_answer, warmup_evaluator_model
 from rag_engine import get_rag_engine, warmup_rag_system
 from resume_parser import extract_skills, extract_text_from_pdf, warmup_skill_extractor
 
@@ -66,6 +66,7 @@ for key, default in {
     "pending_retake_role": "",
     "pending_retake_count": 6,
     "typed_done": {},
+    "reference_cache": {},
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -125,6 +126,7 @@ def _start_interview(role: str, count: int) -> None:
     st.session_state.evaluations = [None] * len(questions)
     st.session_state.interview_started = True
     st.session_state.typed_done = {}
+    st.session_state.reference_cache = {}
 
 
 if not st.session_state.runtime_ready:
@@ -152,7 +154,7 @@ if not st.session_state.runtime_ready:
     steps = [
         ("Preparing keyword skill extraction...", warmup_skill_extractor),
         ("Loading embedding model and building FAISS index...", lambda: warmup_rag_system(str(DATA_FILE))),
-        ("Loading FLAN-T5 answer evaluator...", warmup_evaluator_model),
+        ("Loading Qwen-0.5B answer evaluator...", warmup_evaluator_model),
     ]
 
     try:
@@ -264,8 +266,10 @@ with right_col:
         with c1:
             if st.button("Submit Answer", use_container_width=True):
                 st.session_state.answers[idx] = st.session_state.current_answer_input
-                with st.spinner("AI interviewer reviewing your answer..."):
+                question_key = f"{selected_role}::{questions[idx]}"
+                with st.spinner("AI interviewer reviewing your answer and preparing reference... (first run may load model)"):
                     evaluation = evaluate_answer(questions[idx], st.session_state.current_answer_input, selected_role)
+                    st.session_state.reference_cache[question_key] = generate_reference_answer(questions[idx], selected_role)
                 st.session_state.evaluations[idx] = evaluation
                 st.rerun()
 
@@ -287,12 +291,16 @@ with right_col:
                 st.caption("Strengths")
                 _render_typing(st.empty(), ev["strengths"], f"q{idx}_strengths_{hash(ev['strengths'])}")
             with m3:
-                st.caption("Improvements")
+                st.caption("Weaknesses / Missing Points")
                 _render_typing(st.empty(), ev["improvements"], f"q{idx}_improvements_{hash(ev['improvements'])}")
 
-            if ev.get("model_answer"):
-                with st.expander("AI Reference Answer (Learn from this)", expanded=True):
-                    _render_typing(st.empty(), ev["model_answer"], f"q{idx}_model_{hash(ev['model_answer'])}", delay=0.008)
+            question_key = f"{selected_role}::{questions[idx]}"
+            with st.expander("AI Reference Answer (Learn from this)", expanded=False):
+                ref = st.session_state.reference_cache.get(question_key, "")
+                if ref:
+                    _render_typing(st.empty(), ref, f"q{idx}_model_{hash(ref)}", delay=0.008)
+                else:
+                    st.caption("Reference answer will appear after you submit this question.")
 
         completed = [x for x in st.session_state.evaluations if x is not None]
         if completed:

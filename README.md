@@ -10,7 +10,7 @@ This project is an AI-powered Interview Preparation Bot built with a Retrieval A
   - `sentence-transformers` (`all-MiniLM-L6-v2`)
   - `FAISS` vector database
 - Interactive interview mode (question by question)
-- Answer evaluation using `google/flan-t5-base`
+- Answer evaluation using `Qwen/Qwen2.5-0.5B-Instruct` with heavier model fallbacks (override with `EVALUATOR_MODEL`)
 - Final interview score summary
 - Streamlit UI for end-to-end workflow
 - Apple Silicon Metal (`MPS`) support for PyTorch-backed models
