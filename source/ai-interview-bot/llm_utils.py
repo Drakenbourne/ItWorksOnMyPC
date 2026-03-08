@@ -21,6 +21,18 @@ PUTER_BRIDGE_PATH = Path(__file__).with_name("puter_bridge.js")
 KNOWN_ROLES = ["Backend", "AI Engineer", "Data Scientist", "Fullstack"]
 TONE_LABELS = {"easy": "Easy", "medium": "Medium", "strict": "Strict"}
 TONE_SCORE_BIAS = {"easy": 1, "medium": 0, "strict": -1}
+PERSONA_INSTRUCTIONS = {
+    "Friendly Mentor": "Warm, encouraging, and coaching-oriented while still technically accurate.",
+    "FAANG Bar Raiser": "Highly rigorous, depth-focused, and strict about trade-offs and scale.",
+    "Startup CTO": "Pragmatic, product-minded, and focused on speed, ownership, and impact.",
+}
+COMPETENCY_DIMENSIONS = [
+    "Technical Depth",
+    "Communication",
+    "System Thinking",
+    "Practicality",
+    "Trade-offs",
+]
 
 
 def get_evaluator_provider() -> str:
@@ -216,6 +228,13 @@ def _normalize_tone(tone: str) -> str:
     if t in TONE_LABELS:
         return t
     return "medium"
+
+
+def _normalize_persona(persona: str) -> str:
+    p = (persona or "").strip()
+    if p in PERSONA_INSTRUCTIONS:
+        return p
+    return "Friendly Mentor"
 
 
 def _normalize_role_name(role_value: Any, fallback: str = "Backend") -> str:
@@ -428,6 +447,107 @@ def _derive_weakness(question: str, answer: str) -> str:
     return "You should " + ", and ".join(missing[:2]) + "."
 
 
+def _clamp_score(x: int) -> int:
+    return max(1, min(10, int(x)))
+
+
+def _heuristic_competencies(question: str, answer: str, overall_score: int) -> Dict[str, int]:
+    tokens = _tokenize(answer)
+    length = len(tokens)
+    richness = _technical_richness(answer)
+    answer_l = (answer or "").lower()
+    relevance = 1 if _is_relevant_to_question(question, answer) else 0
+
+    technical = _clamp_score(max(overall_score - 1, 2) + (1 if richness >= 4 else 0))
+    communication = _clamp_score(
+        3
+        + (1 if length >= 12 else 0)
+        + (1 if length >= 25 else 0)
+        + (1 if any(w in answer_l for w in ["first", "then", "finally", "because"]) else 0)
+    )
+    system_thinking = _clamp_score(
+        2
+        + (2 if any(w in answer_l for w in ["scale", "latency", "throughput", "reliability", "monitoring"]) else 0)
+        + (1 if "distributed" in answer_l or "queue" in answer_l else 0)
+        + (1 if relevance else 0)
+    )
+    practicality = _clamp_score(
+        2
+        + (2 if any(w in answer_l for w in ["for example", "example", "e.g", "such as"]) else 0)
+        + (1 if any(w in answer_l for w in ["implemented", "used", "built", "deployed"]) else 0)
+        + (1 if any(ch.isdigit() for ch in answer_l) else 0)
+    )
+    tradeoffs = _clamp_score(
+        1
+        + (3 if any(w in answer_l for w in ["trade-off", "tradeoff", "pros", "cons", "however"]) else 0)
+        + (1 if "because" in answer_l else 0)
+    )
+
+    return {
+        "Technical Depth": technical,
+        "Communication": communication,
+        "System Thinking": system_thinking,
+        "Practicality": practicality,
+        "Trade-offs": tradeoffs,
+    }
+
+
+def _sanitize_competencies(raw: Any, fallback: Dict[str, int]) -> Dict[str, int]:
+    out = {}
+    if isinstance(raw, dict):
+        for dim in COMPETENCY_DIMENSIONS:
+            value = raw.get(dim)
+            if value is None:
+                # Support lowercase keys from model output.
+                value = raw.get(dim.lower())
+            if value is None:
+                value = fallback[dim]
+            out[dim] = _coerce_score(value)
+    else:
+        out = fallback.copy()
+    for dim in COMPETENCY_DIMENSIONS:
+        out.setdefault(dim, fallback[dim])
+        out[dim] = _clamp_score(out[dim])
+    return out
+
+
+def _score_competencies_with_model(
+    question: str,
+    answer: str,
+    role: str,
+    tone: str,
+    persona: str,
+    overall_score: int,
+) -> Optional[Dict[str, int]]:
+    tone_value = _normalize_tone(tone)
+    persona_value = _normalize_persona(persona)
+    prompt = (
+        "Score the candidate answer on five competencies.\n"
+        "Return strict JSON only with integer values from 1 to 10.\n"
+        "Keys must be exactly: Technical Depth, Communication, System Thinking, Practicality, Trade-offs.\n\n"
+        f"Role: {role}\n"
+        f"Interviewer tone: {TONE_LABELS[tone_value]}\n"
+        f"Interviewer persona: {persona_value} ({PERSONA_INSTRUCTIONS[persona_value]})\n"
+        f"Question: {question}\n"
+        f"Candidate answer: {answer}\n"
+        f"Overall score context: {overall_score}/10\n"
+    )
+    raw = _run_chat(
+        system_prompt="You are a precise interview rubric grader.",
+        user_prompt=prompt,
+        max_new_tokens=180,
+    )
+    parsed = _extract_json_block(raw)
+    if not parsed:
+        return None
+    base = _heuristic_competencies(question, answer, overall_score)
+    scored = _sanitize_competencies(parsed, base)
+    # Keep competency values consistent with overall score envelope.
+    for dim in COMPETENCY_DIMENSIONS:
+        scored[dim] = _clamp_score(max(overall_score - 3, min(overall_score + 3, scored[dim])))
+    return scored
+
+
 def _extract_json_block(text: str) -> Optional[Dict[str, Any]]:
     raw = (text or "").strip()
     if not raw:
@@ -504,8 +624,15 @@ def _looks_grounded_feedback(feedback: str, question: str, answer: str) -> bool:
     return len(f_tokens.intersection(a_tokens.union(q_tokens))) >= 2
 
 
-def _evaluate_with_model(question: str, answer: str, role: str, tone: str) -> Optional[Dict[str, str]]:
+def _evaluate_with_model(
+    question: str,
+    answer: str,
+    role: str,
+    tone: str,
+    persona: str,
+) -> Optional[Dict[str, str]]:
     tone_value = _normalize_tone(tone)
+    persona_value = _normalize_persona(persona)
     tone_instruction = {
         "easy": "Be supportive and coaching-oriented while staying truthful to the answer.",
         "medium": "Be balanced and interview-realistic.",
@@ -522,6 +649,7 @@ def _evaluate_with_model(question: str, answer: str, role: str, tone: str) -> Op
         "- improvements: one concise sentence on what is missing or can be improved\n"
         "- If answer is abusive/off-topic/very low-quality, set score <= 2 and reflect that clearly.\n\n"
         f"Interviewer tone: {TONE_LABELS[tone_value]} ({tone_instruction})\n"
+        f"Interviewer persona: {persona_value} ({PERSONA_INSTRUCTIONS[persona_value]})\n"
         f"Role: {role}\n"
         f"Question: {question}\n"
         f"Candidate answer: {answer}\n"
@@ -563,16 +691,29 @@ def _final_score(
     return max(1, min(10, score))
 
 
-def evaluate_answer(question: str, answer: str, role: str, tone: str = "medium") -> Dict[str, str]:
+def evaluate_answer(
+    question: str,
+    answer: str,
+    role: str,
+    tone: str = "medium",
+    persona: str = "Friendly Mentor",
+) -> Dict[str, Any]:
     safe_answer = (answer or "").strip() or "No candidate answer provided."
     tone_value = _normalize_tone(tone)
+    persona_value = _normalize_persona(persona)
 
     heuristic_strength = _normalize_line(_derive_strength(question, safe_answer))
     heuristic_weakness = _normalize_line(_derive_weakness(question, safe_answer))
 
     model_eval: Optional[Dict[str, str]] = None
     try:
-        model_eval = _evaluate_with_model(question, safe_answer, role, tone=tone_value)
+        model_eval = _evaluate_with_model(
+            question,
+            safe_answer,
+            role,
+            tone=tone_value,
+            persona=persona_value,
+        )
     except Exception:
         model_eval = None
 
@@ -592,12 +733,40 @@ def evaluate_answer(question: str, answer: str, role: str, tone: str = "medium")
         model_score = _coerce_score(model_eval.get("score"))
 
     final_score = _final_score(question, safe_answer, strengths, tone=tone_value, model_score=model_score)
-    return {"score": final_score, "strengths": strengths, "improvements": improvements}
+    competencies = _heuristic_competencies(question, safe_answer, final_score)
+    try:
+        modeled_comp = _score_competencies_with_model(
+            question=question,
+            answer=safe_answer,
+            role=role,
+            tone=tone_value,
+            persona=persona_value,
+            overall_score=final_score,
+        )
+        if modeled_comp:
+            competencies = modeled_comp
+    except Exception:
+        pass
+
+    evidence = _top_grounded_phrases(question, safe_answer, limit=3)
+    return {
+        "score": final_score,
+        "strengths": strengths,
+        "improvements": improvements,
+        "competencies": competencies,
+        "evidence": evidence,
+    }
 
 
 @lru_cache(maxsize=512)
-def generate_reference_answer(question: str, role: str, tone: str = "medium") -> str:
+def generate_reference_answer(
+    question: str,
+    role: str,
+    tone: str = "medium",
+    persona: str = "Friendly Mentor",
+) -> str:
     tone_value = _normalize_tone(tone)
+    persona_value = _normalize_persona(persona)
     tone_instruction = {
         "easy": "Keep wording approachable but still technical.",
         "medium": "Keep wording balanced and interview-ready.",
@@ -609,6 +778,7 @@ def generate_reference_answer(question: str, role: str, tone: str = "medium") ->
         user_prompt=(
             f"Role: {role}\n"
             f"Interviewer tone: {TONE_LABELS[tone_value]} ({tone_instruction})\n"
+            f"Interviewer persona: {persona_value} ({PERSONA_INSTRUCTIONS[persona_value]})\n"
             f"Question: {question}\n\n"
             "Provide the best candidate answer in 5 to 7 complete sentences.\n"
             "Write in first-person interview style, technically detailed, coherent, and concise.\n"
@@ -654,3 +824,327 @@ def generate_reference_answer(question: str, role: str, tone: str = "medium") ->
         sentences = sentences[:7]
     cleaned = _normalize_line(" ".join(sentences))
     return f"Model Answer: {cleaned}"
+
+
+@lru_cache(maxsize=1024)
+def generate_interviewer_reply(
+    question: str,
+    answer: str,
+    role: str,
+    tone: str,
+    persona: str,
+    score: int,
+    strengths: str,
+    improvements: str,
+) -> str:
+    tone_value = _normalize_tone(tone)
+    persona_value = _normalize_persona(persona)
+    safe_answer = (answer or "").strip() or "No candidate answer provided."
+    safe_strengths = _normalize_line(strengths)
+    safe_improvements = _normalize_line(improvements)
+    safe_score = _coerce_score(score)
+
+    prompt = (
+        "You are the interviewer speaking directly to the candidate after hearing their answer.\n"
+        "Write 2 to 3 natural conversational sentences.\n"
+        "Rules:\n"
+        "- sound human, not robotic\n"
+        "- mention one specific positive from their answer\n"
+        "- mention one concrete improvement\n"
+        "- do not include headings, bullet points, JSON, or score formatting\n\n"
+        f"Role: {role}\n"
+        f"Interviewer tone: {TONE_LABELS[tone_value]}\n"
+        f"Interviewer persona: {persona_value} ({PERSONA_INSTRUCTIONS[persona_value]})\n"
+        f"Question: {question}\n"
+        f"Candidate answer: {safe_answer}\n"
+        f"Score context: {safe_score}/10\n"
+        f"Grounded strengths: {safe_strengths}\n"
+        f"Grounded improvements: {safe_improvements}\n"
+    )
+
+    try:
+        text = _run_chat(
+            system_prompt="You are a thoughtful technical interviewer giving spoken-style feedback.",
+            user_prompt=prompt,
+            max_new_tokens=140,
+        )
+        cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+        cleaned = re.sub(r"^(interviewer|feedback)\s*:\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.strip()
+        if cleaned and cleaned[-1] not in ".!?":
+            cleaned += "."
+        if cleaned:
+            return cleaned
+    except Exception:
+        pass
+
+    return (
+        f"Thanks for your answer. {safe_strengths} "
+        f"To level this up further, {safe_improvements[0].lower() + safe_improvements[1:] if safe_improvements else 'add more technical depth and one concrete example.'}"
+    )
+
+
+def _sanitize_question_line(text: str) -> str:
+    line = re.sub(r"^\s*[-*\d\).:]+\s*", "", str(text or "").strip())
+    line = re.sub(r"\s+", " ", line).strip()
+    if not line:
+        return ""
+    if "?" not in line:
+        line = line.rstrip(".") + "?"
+    return line
+
+
+def generate_custom_questions(
+    role: str,
+    skills: List[str],
+    jd_context: str,
+    count: int,
+    persona: str = "Friendly Mentor",
+) -> List[str]:
+    if count <= 0:
+        return []
+    persona_value = _normalize_persona(persona)
+    skill_text = ", ".join((skills or [])[:10]) or "general software engineering"
+    prompt = (
+        "Generate custom technical interview questions tailored to this candidate.\n"
+        "Return strict JSON with one key: questions (array of strings).\n"
+        f"Need exactly {count} questions.\n"
+        "Each question must be concise, role-specific, and answerable in an interview.\n\n"
+        f"Role: {role}\n"
+        f"Interviewer persona: {persona_value} ({PERSONA_INSTRUCTIONS[persona_value]})\n"
+        f"Candidate skills: {skill_text}\n"
+        f"Job description context: {jd_context[:1200] or '[none]'}\n"
+    )
+    try:
+        raw = _run_chat(
+            system_prompt="You create high-signal interview question sets.",
+            user_prompt=prompt,
+            max_new_tokens=min(220, 70 + count * 35),
+        )
+        parsed = _extract_json_block(raw)
+        items = parsed.get("questions") if isinstance(parsed, dict) else None
+        out: List[str] = []
+        if isinstance(items, list):
+            for item in items:
+                q = _sanitize_question_line(str(item))
+                if q and q not in out:
+                    out.append(q)
+                if len(out) >= count:
+                    break
+        if out:
+            return out[:count]
+    except Exception:
+        pass
+    return []
+
+
+def generate_followup_question(
+    question: str,
+    answer: str,
+    role: str,
+    score: int,
+    tone: str = "medium",
+    persona: str = "Friendly Mentor",
+) -> Optional[Dict[str, str]]:
+    score_i = _coerce_score(score)
+    if 7 <= score_i <= 7:
+        return None
+
+    mode = "deepen" if score_i <= 6 else "stretch"
+    tone_value = _normalize_tone(tone)
+    persona_value = _normalize_persona(persona)
+    mode_instruction = (
+        "Ask one clarifying/deepening follow-up that helps the candidate strengthen missing details."
+        if mode == "deepen"
+        else "Ask one higher-difficulty stretch follow-up that tests deeper reasoning."
+    )
+    prompt = (
+        f"{mode_instruction}\n"
+        "Return only one follow-up interview question.\n"
+        "Do not add explanation.\n\n"
+        f"Role: {role}\n"
+        f"Interviewer tone: {TONE_LABELS[tone_value]}\n"
+        f"Interviewer persona: {persona_value} ({PERSONA_INSTRUCTIONS[persona_value]})\n"
+        f"Original question: {question}\n"
+        f"Candidate answer: {answer}\n"
+        f"Score context: {score_i}/10\n"
+    )
+    try:
+        raw = _run_chat(
+            system_prompt="You are a technical interviewer generating one follow-up question.",
+            user_prompt=prompt,
+            max_new_tokens=90,
+        )
+        q = _sanitize_question_line(raw)
+        if q:
+            label = "FOLLOW-UP:DEEPEN" if mode == "deepen" else "FOLLOW-UP:STRETCH"
+            return {"question": q, "source": label, "mode": mode}
+    except Exception:
+        pass
+
+    if mode == "deepen":
+        fallback = f"Can you walk me through a concrete implementation for your approach to: {question}"
+        return {"question": _sanitize_question_line(fallback), "source": "FOLLOW-UP:DEEPEN", "mode": mode}
+    fallback = f"What trade-offs would you make if scale or latency constraints became much tighter for: {question}"
+    return {"question": _sanitize_question_line(fallback), "source": "FOLLOW-UP:STRETCH", "mode": mode}
+
+
+def _heuristic_hiring_signal(evaluations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not evaluations:
+        return {"decision": "NO_HIRE", "rationale": "Insufficient interview evidence.", "evidence": []}
+    avg = sum(int(e.get("score", 1)) for e in evaluations) / len(evaluations)
+    if avg >= 8.2:
+        decision = "STRONG_HIRE"
+    elif avg >= 6.4:
+        decision = "HIRE"
+    else:
+        decision = "NO_HIRE"
+    evidence: List[str] = []
+    for ev in evaluations[:3]:
+        s = _normalize_line(ev.get("strengths", ""))
+        if s:
+            evidence.append(s)
+    return {
+        "decision": decision,
+        "rationale": f"Average interview performance was {avg:.2f}/10 across evaluated questions.",
+        "evidence": evidence[:3],
+    }
+
+
+def summarize_hiring_signal(
+    role: str,
+    level: str,
+    tone: str,
+    persona: str,
+    questions: List[str],
+    answers: List[str],
+    evaluations: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    valid = []
+    for i, ev in enumerate(evaluations):
+        if ev is None:
+            continue
+        valid.append(
+            {
+                "question": questions[i] if i < len(questions) else "",
+                "answer": answers[i] if i < len(answers) else "",
+                "score": ev.get("score", 1),
+                "strengths": ev.get("strengths", ""),
+                "improvements": ev.get("improvements", ""),
+            }
+        )
+    if not valid:
+        return _heuristic_hiring_signal([])
+
+    tone_value = _normalize_tone(tone)
+    persona_value = _normalize_persona(persona)
+    prompt = (
+        "You are deciding an interview hiring signal.\n"
+        "Return strict JSON keys: decision, rationale, evidence.\n"
+        "- decision must be one of: STRONG_HIRE, HIRE, NO_HIRE\n"
+        "- rationale: 1-2 sentences\n"
+        "- evidence: array of 2-4 concise bullet-style strings grounded in candidate answers\n\n"
+        f"Role: {role}\n"
+        f"Level: {level}\n"
+        f"Interviewer tone: {TONE_LABELS[tone_value]}\n"
+        f"Interviewer persona: {persona_value} ({PERSONA_INSTRUCTIONS[persona_value]})\n"
+        f"Interview data JSON:\n{json.dumps(valid)[:7000]}"
+    )
+    try:
+        raw = _run_chat(
+            system_prompt="You are an experienced hiring committee member.",
+            user_prompt=prompt,
+            max_new_tokens=240,
+        )
+        parsed = _extract_json_block(raw)
+        if isinstance(parsed, dict):
+            decision = str(parsed.get("decision", "NO_HIRE")).strip().upper()
+            if decision not in {"STRONG_HIRE", "HIRE", "NO_HIRE"}:
+                decision = "NO_HIRE"
+            rationale = _normalize_line(parsed.get("rationale", ""))
+            evidence_raw = parsed.get("evidence", [])
+            evidence: List[str] = []
+            if isinstance(evidence_raw, list):
+                for item in evidence_raw:
+                    line = _normalize_line(item)
+                    if line:
+                        evidence.append(line)
+                    if len(evidence) >= 4:
+                        break
+            if not evidence:
+                evidence = _heuristic_hiring_signal([v for v in valid]).get("evidence", [])
+            return {"decision": decision, "rationale": rationale, "evidence": evidence[:4]}
+    except Exception:
+        pass
+    return _heuristic_hiring_signal([v for v in valid])
+
+
+def generate_debrief_report(
+    role: str,
+    level: str,
+    tone: str,
+    persona: str,
+    questions: List[str],
+    answers: List[str],
+    evaluations: List[Dict[str, Any]],
+) -> str:
+    tone_value = _normalize_tone(tone)
+    persona_value = _normalize_persona(persona)
+    valid = []
+    for i, ev in enumerate(evaluations):
+        if ev is None:
+            continue
+        valid.append(
+            {
+                "question": questions[i] if i < len(questions) else "",
+                "answer": answers[i] if i < len(answers) else "",
+                "score": ev.get("score", 1),
+                "strengths": ev.get("strengths", ""),
+                "improvements": ev.get("improvements", ""),
+            }
+        )
+    if not valid:
+        return "# Interview Debrief\n\nNo completed answers yet."
+
+    prompt = (
+        "Write a concise markdown debrief report for the candidate.\n"
+        "Include sections exactly:\n"
+        "1) Overall Summary\n"
+        "2) Top Strengths\n"
+        "3) Gaps / Missed Concepts\n"
+        "4) 7-Day Improvement Plan (daily bullets)\n"
+        "5) Next Mock Interview Strategy\n\n"
+        f"Role: {role}\n"
+        f"Level: {level}\n"
+        f"Interviewer tone: {TONE_LABELS[tone_value]}\n"
+        f"Interviewer persona: {persona_value} ({PERSONA_INSTRUCTIONS[persona_value]})\n"
+        f"Interview data JSON:\n{json.dumps(valid)[:7000]}"
+    )
+    try:
+        text = _run_chat(
+            system_prompt="You are a senior interview coach creating actionable prep plans.",
+            user_prompt=prompt,
+            max_new_tokens=520,
+        )
+        cleaned = str(text or "").strip()
+        if cleaned:
+            return cleaned
+    except Exception:
+        pass
+
+    avg = sum(int(v.get("score", 1)) for v in valid) / len(valid)
+    return (
+        "# Interview Debrief\n\n"
+        f"## Overall Summary\nCurrent average score: **{avg:.2f}/10** for **{role} ({level})**.\n\n"
+        "## Top Strengths\n- You referenced relevant technical concepts from the asked questions.\n\n"
+        "## Gaps / Missed Concepts\n- Add deeper implementation specifics and explicit trade-off discussion.\n\n"
+        "## 7-Day Improvement Plan (daily bullets)\n"
+        "- Day 1: Re-answer weakest two questions with concrete examples.\n"
+        "- Day 2: Practice explaining one system trade-off per answer.\n"
+        "- Day 3: Drill role-specific fundamentals for 60 minutes.\n"
+        "- Day 4: Do a timed mock round (4 questions).\n"
+        "- Day 5: Review and rewrite answers with measurable impact.\n"
+        "- Day 6: Practice concise communication and structure.\n"
+        "- Day 7: Full mock interview and retrospective.\n\n"
+        "## Next Mock Interview Strategy\nFocus on depth first, then concision. Include one implementation example and one trade-off in every answer."
+    )

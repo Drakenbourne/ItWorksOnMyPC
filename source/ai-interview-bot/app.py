@@ -1,4 +1,6 @@
 import time
+import math
+from html import escape
 from pathlib import Path
 from typing import List
 
@@ -8,8 +10,13 @@ from device_utils import get_device
 from llm_utils import (
     analyze_candidate_profile,
     evaluate_answer,
+    generate_custom_questions,
+    generate_debrief_report,
+    generate_followup_question,
+    generate_interviewer_reply,
     generate_reference_answer,
     get_evaluator_backend_label,
+    summarize_hiring_signal,
     warmup_evaluator_model,
 )
 from rag_engine import get_rag_engine, warmup_rag_system
@@ -40,6 +47,12 @@ DATA_FILE = Path(__file__).parent / "data" / "interview_questions.txt"
 ROLES = ["Backend", "AI Engineer", "Data Scientist", "Fullstack"]
 ROLE_MODES = ["Select Role", "Infer From Job Description"]
 INTERVIEW_TONES = ["Easy", "Medium", "Strict"]
+INTERVIEW_PERSONAS = ["Friendly Mentor", "FAANG Bar Raiser", "Startup CTO"]
+TARGET_LEVELS = ["Intern", "Junior", "Mid", "Senior"]
+COMPETENCY_DIMENSIONS = ["Technical Depth", "Communication", "System Thinking", "Practicality", "Trade-offs"]
+
+LEVEL_BASE_EXPECTED = {"Intern": 4.8, "Junior": 5.8, "Mid": 6.8, "Senior": 7.8}
+ROLE_EXPECTED_DELTA = {"Backend": 0.1, "AI Engineer": 0.2, "Data Scientist": 0.15, "Fullstack": 0.05}
 
 ROLE_CATEGORY_HINTS = {
     "Backend": ["Backend Development", "System Design", "Software Engineering"],
@@ -80,8 +93,17 @@ for key, default in {
     "pending_retake_count": 6,
     "typed_done": {},
     "reference_cache": {},
+    "interviewer_cache": {},
+    "hiring_signal_cache": {},
+    "debrief_cache": {},
+    "followup_generated_for": [],
     "interview_tone": "Medium",
+    "interviewer_persona": "Friendly Mentor",
+    "target_level": "Mid",
     "role_mode": ROLE_MODES[0],
+    "resume_file_sig": "",
+    "jd_file_sig": "",
+    "analysis_signature": "",
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -93,7 +115,7 @@ def _render_typing(
     container,
     text: str,
     anim_key: str,
-    words_per_minute: int = 40,
+    words_per_minute: int = 600,
     max_duration_sec: float = 12.0,
 ) -> None:
     text = (text or "").strip()
@@ -121,6 +143,104 @@ def _render_typing(
     st.session_state.typed_done = typed_done
 
 
+def _uploaded_file_sig(uploaded_file) -> str:
+    if uploaded_file is None:
+        return ""
+    name = getattr(uploaded_file, "name", "")
+    size = getattr(uploaded_file, "size", 0)
+    return f"{name}:{size}"
+
+
+def _invalidate_profile_analysis() -> None:
+    st.session_state.analysis_done = False
+    st.session_state.analysis_role = ""
+    st.session_state.analysis_focus = ""
+    st.session_state.skills = []
+    st.session_state.analysis_signature = ""
+
+
+def _live_structure_hints(answer: str) -> List[str]:
+    text = (answer or "").strip().lower()
+    tokens = text.split()
+    hints: List[str] = []
+    if len(tokens) < 20:
+        hints.append("Add more technical depth in 3-5 sentences.")
+    if not any(k in text for k in ["example", "for instance", "e.g", "such as"]):
+        hints.append("Include one concrete implementation example.")
+    if not any(k in text for k in ["trade-off", "tradeoff", "pros", "cons", "however"]):
+        hints.append("Mention one trade-off and why it matters.")
+    if not any(ch.isdigit() for ch in text):
+        hints.append("Add a measurable outcome or constraint (latency, scale, cost, etc.).")
+    if not any(k in text for k in ["first", "then", "finally", "because"]):
+        hints.append("Structure your answer clearly: approach -> reasoning -> result.")
+    return hints[:3]
+
+
+def _render_competency_radar(competencies: dict, chart_key: str, title: str) -> None:
+    dims = COMPETENCY_DIMENSIONS
+    values = [max(1, min(10, int(competencies.get(d, 1)))) for d in dims]
+    n = len(dims)
+    cx, cy, radius = 150, 150, 95
+
+    def pt(angle: float, r: float) -> tuple[float, float]:
+        return cx + r * math.cos(angle), cy + r * math.sin(angle)
+
+    angles = [(-math.pi / 2) + (2 * math.pi * i / n) for i in range(n)]
+    grid = []
+    for frac in [0.2, 0.4, 0.6, 0.8, 1.0]:
+        pts = []
+        for a in angles:
+            x, y = pt(a, radius * frac)
+            pts.append(f"{x:.1f},{y:.1f}")
+        grid.append(f"<polygon points='{' '.join(pts)}' fill='none' stroke='#334155' stroke-width='1' />")
+
+    axes = []
+    labels = []
+    for i, a in enumerate(angles):
+        x, y = pt(a, radius)
+        axes.append(f"<line x1='{cx}' y1='{cy}' x2='{x:.1f}' y2='{y:.1f}' stroke='#475569' stroke-width='1' />")
+        lx, ly = pt(a, radius + 24)
+        labels.append(
+            f"<text x='{lx:.1f}' y='{ly:.1f}' fill='#cbd5e1' font-size='11' text-anchor='middle'>{escape(dims[i])}</text>"
+        )
+
+    data_pts = []
+    for i, a in enumerate(angles):
+        x, y = pt(a, radius * (values[i] / 10.0))
+        data_pts.append(f"{x:.1f},{y:.1f}")
+
+    svg = f"""
+    <div style="border:1px solid #334155;border-radius:12px;padding:8px;background:#0b1220;">
+      <div style="font-size:13px;color:#cbd5e1;margin:0 0 6px 4px;">{escape(title)}</div>
+      <svg width="300" height="300" viewBox="0 0 300 300">
+        {''.join(grid)}
+        {''.join(axes)}
+        <polygon points="{' '.join(data_pts)}" fill="rgba(56,189,248,0.28)" stroke="#38bdf8" stroke-width="2" />
+        {''.join(labels)}
+      </svg>
+    </div>
+    """
+    st.markdown(svg, unsafe_allow_html=True)
+    st.caption(" | ".join([f"{d}: {v}/10" for d, v in zip(dims, values)]))
+
+
+def _percentile_benchmark(role: str, level: str, avg_score: float, competencies: dict) -> dict:
+    base = LEVEL_BASE_EXPECTED.get(level, 6.8) + ROLE_EXPECTED_DELTA.get(role, 0.1)
+    comp_avg = 0.0
+    if competencies:
+        comp_avg = sum(float(competencies.get(d, 0)) for d in COMPETENCY_DIMENSIONS) / max(1, len(COMPETENCY_DIMENSIONS))
+    blended = (avg_score * 0.75) + (comp_avg * 0.25 if comp_avg else avg_score * 0.25)
+    delta = blended - base
+    percentile = int(max(5, min(99, round(50 + (delta * 18)))))
+    if percentile >= 75:
+        band = "Above Expected"
+    elif percentile >= 45:
+        band = "At Expected"
+    else:
+        band = "Below Expected"
+    return {"percentile": percentile, "band": band, "expected_score": round(base, 2)}
+
+
 def _filter_skills_for_role(skills: List[str], role: str) -> List[str]:
     role_hints = ROLE_SKILL_HINTS.get(role, [])
     filtered = []
@@ -133,7 +253,7 @@ def _filter_skills_for_role(skills: List[str], role: str) -> List[str]:
     return filtered
 
 
-def _start_interview(role: str, count: int, jd_context: str = "") -> None:
+def _start_interview(role: str, count: int, jd_context: str = "", persona: str = "Friendly Mentor") -> None:
     rag_engine = get_rag_engine(str(DATA_FILE))
     filtered_skills = _filter_skills_for_role(st.session_state.skills, role)
     skill_query = ", ".join(filtered_skills[:8])
@@ -148,23 +268,69 @@ def _start_interview(role: str, count: int, jd_context: str = "") -> None:
         query_parts.append(f"Job Description Context: {jd_query}")
     retrieval_query = ". ".join(query_parts)
 
-    questions = rag_engine.retrieve_questions(
+    custom_count = max(1, count // 3)
+    rag_count = max(1, count - custom_count)
+
+    rag_questions = rag_engine.retrieve_questions(
         retrieval_query,
-        top_k=count,
+        top_k=rag_count,
         preferred_categories=ROLE_CATEGORY_HINTS.get(role, []),
     )
+    custom_questions = generate_custom_questions(
+        role=role,
+        skills=filtered_skills,
+        jd_context=jd_query,
+        count=custom_count,
+        persona=persona,
+    )
 
-    st.session_state.questions = questions
-    st.session_state.question_sources = ["RAG"] * len(questions)
+    combined_questions: List[str] = []
+    combined_sources: List[str] = []
+    r, c = 0, 0
+    while len(combined_questions) < count and (r < len(rag_questions) or c < len(custom_questions)):
+        if r < len(rag_questions):
+            q = rag_questions[r]
+            r += 1
+            if q not in combined_questions:
+                combined_questions.append(q)
+                combined_sources.append("RAG")
+                if len(combined_questions) >= count:
+                    break
+        if c < len(custom_questions):
+            q = custom_questions[c]
+            c += 1
+            if q not in combined_questions:
+                combined_questions.append(q)
+                combined_sources.append("CUSTOM")
+                if len(combined_questions) >= count:
+                    break
+
+    if len(combined_questions) < count:
+        fallback = rag_engine.retrieve_questions(
+            retrieval_query,
+            top_k=count,
+            preferred_categories=ROLE_CATEGORY_HINTS.get(role, []),
+        )
+        for q in fallback:
+            if q not in combined_questions:
+                combined_questions.append(q)
+                combined_sources.append("RAG")
+            if len(combined_questions) >= count:
+                break
+
+    st.session_state.questions = combined_questions
+    st.session_state.question_sources = combined_sources
     st.session_state.interview_role = role
     st.session_state.current_index = 0
     st.session_state.active_question_index = 0
     st.session_state.current_answer_input = ""
-    st.session_state.answers = [""] * len(questions)
-    st.session_state.evaluations = [None] * len(questions)
+    st.session_state.answers = [""] * len(combined_questions)
+    st.session_state.evaluations = [None] * len(combined_questions)
     st.session_state.interview_started = True
     st.session_state.typed_done = {}
     st.session_state.reference_cache = {}
+    st.session_state.interviewer_cache = {}
+    st.session_state.followup_generated_for = []
 
 
 if not st.session_state.runtime_ready:
@@ -239,26 +405,50 @@ with left_col:
     st.subheader("Workflow")
     role_mode = st.radio("Interview Setup", ROLE_MODES, key="role_mode", horizontal=True)
     manual_role = st.selectbox("Target Role", ROLES, key="manual_role", disabled=role_mode != ROLE_MODES[0])
-    st.select_slider("Interviewer Tone", options=INTERVIEW_TONES, key="interview_tone")
+    st.selectbox("Target Level", TARGET_LEVELS, key="target_level")
     question_count = st.slider("Number of Questions", min_value=3, max_value=12, value=6)
     uploaded_file = st.file_uploader("Step 1: Upload Resume (PDF/TXT)", type=["pdf", "txt"])
-    jd_uploaded_file = st.file_uploader("Optional: Upload Job Description (PDF/TXT)", type=["pdf", "txt"])
-    jd_pasted = st.text_area(
-        "Or paste Job Description text",
-        value=st.session_state.jd_text,
-        height=120,
-        placeholder="Paste JD text here if you don't upload a JD file...",
-    )
+    jd_uploaded_file = None
+    jd_pasted = ""
+    if role_mode == ROLE_MODES[1]:
+        jd_uploaded_file = st.file_uploader("Step 1b: Upload Job Description (PDF/TXT)", type=["pdf", "txt"])
+        jd_pasted = st.text_area(
+            "Or paste Job Description text",
+            value=st.session_state.jd_text,
+            height=120,
+            placeholder="Paste JD text here if you don't upload a JD file...",
+        )
 
     if uploaded_file is not None:
-        with st.spinner("Parsing resume..."):
-            st.session_state.resume_text = extract_text_from_upload(uploaded_file)
+        resume_sig = _uploaded_file_sig(uploaded_file)
+        if resume_sig != st.session_state.resume_file_sig:
+            with st.spinner("Parsing resume..."):
+                st.session_state.resume_text = extract_text_from_upload(uploaded_file)
+            st.session_state.resume_file_sig = resume_sig
+            _invalidate_profile_analysis()
+    elif st.session_state.resume_file_sig:
+        st.session_state.resume_text = ""
+        st.session_state.resume_file_sig = ""
+        _invalidate_profile_analysis()
 
-    if jd_uploaded_file is not None:
-        with st.spinner("Parsing job description..."):
-            st.session_state.jd_text = extract_text_from_upload(jd_uploaded_file)
-    elif jd_pasted.strip():
-        st.session_state.jd_text = jd_pasted.strip()
+    if role_mode == ROLE_MODES[1]:
+        if jd_uploaded_file is not None:
+            jd_sig = _uploaded_file_sig(jd_uploaded_file)
+            if jd_sig != st.session_state.jd_file_sig:
+                with st.spinner("Parsing job description..."):
+                    st.session_state.jd_text = extract_text_from_upload(jd_uploaded_file)
+                st.session_state.jd_file_sig = jd_sig
+                _invalidate_profile_analysis()
+        elif jd_pasted.strip() != st.session_state.jd_text.strip():
+            st.session_state.jd_text = jd_pasted.strip()
+            st.session_state.jd_file_sig = ""
+            _invalidate_profile_analysis()
+    else:
+        # Hide JD input in manual-role mode and avoid using stale JD context.
+        if st.session_state.jd_text:
+            st.session_state.jd_text = ""
+            st.session_state.jd_file_sig = ""
+            _invalidate_profile_analysis()
 
     if st.button("Step 2: Analyze Role + Skills", use_container_width=True):
         if not st.session_state.resume_text:
@@ -267,16 +457,26 @@ with left_col:
             st.warning("Upload or paste a job description to infer role from JD.")
         else:
             selected_for_analysis = manual_role if role_mode == ROLE_MODES[0] else ""
-            with st.spinner("AI is analyzing resume and job context..."):
-                analysis = analyze_candidate_profile(
-                    resume_text=st.session_state.resume_text,
-                    job_description=st.session_state.jd_text,
-                    selected_role=selected_for_analysis,
-                )
-            st.session_state.skills = analysis.get("skills", [])
-            st.session_state.analysis_role = analysis.get("role", manual_role)
-            st.session_state.analysis_focus = analysis.get("jd_focus", "")
-            st.session_state.analysis_done = True
+            analysis_job_desc = st.session_state.jd_text if role_mode == ROLE_MODES[1] else ""
+            analysis_sig = (
+                f"{hash(st.session_state.resume_text)}::"
+                f"{hash(analysis_job_desc)}::"
+                f"{selected_for_analysis}::{role_mode}"
+            )
+            if st.session_state.analysis_done and st.session_state.analysis_signature == analysis_sig:
+                st.info("Using existing analysis for current inputs.")
+            else:
+                with st.spinner("AI is analyzing resume and job context..."):
+                    analysis = analyze_candidate_profile(
+                        resume_text=st.session_state.resume_text,
+                        job_description=analysis_job_desc,
+                        selected_role=selected_for_analysis,
+                    )
+                st.session_state.skills = analysis.get("skills", [])
+                st.session_state.analysis_role = analysis.get("role", manual_role)
+                st.session_state.analysis_focus = analysis.get("jd_focus", "")
+                st.session_state.analysis_done = True
+                st.session_state.analysis_signature = analysis_sig
 
     if st.session_state.analysis_done:
         st.success("Profile analyzed")
@@ -286,7 +486,7 @@ with left_col:
                 st.empty(),
                 f"JD focus: {st.session_state.analysis_focus}",
                 f"focus_{hash(st.session_state.analysis_focus)}",
-                words_per_minute=40,
+                words_per_minute=600,
             )
 
     if st.session_state.skills:
@@ -295,7 +495,7 @@ with left_col:
             st.empty(),
             f"AI-detected skills: {skill_summary}",
             f"skills_{hash(skill_summary)}",
-            words_per_minute=40,
+            words_per_minute=600,
         )
 
     if st.button("Step 3: Start Interview", use_container_width=True):
@@ -303,7 +503,13 @@ with left_col:
             st.warning("Run Step 2 first so AI can set interview role and skills.")
         else:
             role_for_interview = st.session_state.analysis_role or manual_role
-            _start_interview(role_for_interview, question_count, jd_context=st.session_state.jd_text)
+            jd_context = st.session_state.jd_text if role_mode == ROLE_MODES[1] else ""
+            _start_interview(
+                role_for_interview,
+                question_count,
+                jd_context=jd_context,
+                persona=st.session_state.interviewer_persona,
+            )
             st.rerun()
 
 selected_role = st.session_state.analysis_role or st.session_state.get("manual_role", ROLES[0])
@@ -312,12 +518,21 @@ if st.session_state.pending_retake:
     role = st.session_state.pending_retake_role or selected_role
     count = int(st.session_state.pending_retake_count or question_count)
     st.session_state.pending_retake = False
-    _start_interview(role, count, jd_context=st.session_state.jd_text)
+    jd_context = st.session_state.jd_text if st.session_state.role_mode == ROLE_MODES[1] else ""
+    _start_interview(
+        role,
+        count,
+        jd_context=jd_context,
+        persona=st.session_state.interviewer_persona,
+    )
     st.rerun()
 
 with right_col:
     st.subheader("Interview Panel")
+    st.select_slider("Interviewer Tone", options=INTERVIEW_TONES, key="interview_tone")
+    st.selectbox("Interviewer Persona", INTERVIEW_PERSONAS, key="interviewer_persona")
     tone_value = (st.session_state.interview_tone or "Medium").strip().lower()
+    persona_value = st.session_state.interviewer_persona
     interview_role = st.session_state.interview_role or selected_role
 
     if not st.session_state.interview_started:
@@ -339,6 +554,7 @@ with right_col:
             <div class="question-card">
                 <div class="question-source">Source: [{source_label}]</div>
                 <div class="question-source">Interviewer tone: [{st.session_state.interview_tone}]</div>
+                <div class="question-source">Interviewer persona: [{persona_value}]</div>
                 <div><strong>{questions[idx]}</strong></div>
             </div>
             """,
@@ -351,12 +567,17 @@ with right_col:
             height=160,
             placeholder="Explain your approach clearly with technical depth and an example...",
         )
+        hints = _live_structure_hints(st.session_state.current_answer_input)
+        if hints:
+            st.caption("Live Coach")
+            for h in hints:
+                st.caption(f"- {h}")
 
         c1, c2 = st.columns(2)
         with c1:
             if st.button("Submit Answer", use_container_width=True):
                 st.session_state.answers[idx] = st.session_state.current_answer_input
-                question_key = f"{interview_role}::{tone_value}::{questions[idx]}"
+                question_key = f"{interview_role}::{tone_value}::{persona_value}::{questions[idx]}"
                 with st.spinner(
                     f"AI interviewer reviewing your answer and preparing reference via {evaluator_backend}..."
                 ):
@@ -365,13 +586,49 @@ with right_col:
                         st.session_state.current_answer_input,
                         interview_role,
                         tone=tone_value,
+                        persona=persona_value,
+                    )
+                    st.session_state.interviewer_cache[question_key] = generate_interviewer_reply(
+                        question=questions[idx],
+                        answer=st.session_state.current_answer_input,
+                        role=interview_role,
+                        tone=tone_value,
+                        persona=persona_value,
+                        score=evaluation["score"],
+                        strengths=evaluation["strengths"],
+                        improvements=evaluation["improvements"],
                     )
                     st.session_state.reference_cache[question_key] = generate_reference_answer(
                         questions[idx],
                         interview_role,
                         tone=tone_value,
+                        persona=persona_value,
                     )
                 st.session_state.evaluations[idx] = evaluation
+
+                # Adaptive follow-up generation: deepen weak answers, stretch strong answers.
+                followup_key = f"{idx}:{questions[idx]}"
+                seen_followups = set(st.session_state.followup_generated_for or [])
+                source_now = sources[idx] if idx < len(sources) else "RAG"
+                if "FOLLOW-UP" not in source_now and followup_key not in seen_followups:
+                    followup = generate_followup_question(
+                        question=questions[idx],
+                        answer=st.session_state.current_answer_input,
+                        role=interview_role,
+                        score=int(evaluation.get("score", 1)),
+                        tone=tone_value,
+                        persona=persona_value,
+                    )
+                    if followup and followup.get("question"):
+                        fq = followup["question"].strip()
+                        if fq and fq not in st.session_state.questions:
+                            insert_at = idx + 1
+                            st.session_state.questions.insert(insert_at, fq)
+                            st.session_state.question_sources.insert(insert_at, followup.get("source", "FOLLOW-UP"))
+                            st.session_state.answers.insert(insert_at, "")
+                            st.session_state.evaluations.insert(insert_at, None)
+                    seen_followups.add(followup_key)
+                    st.session_state.followup_generated_for = list(seen_followups)
                 st.rerun()
 
         with c2:
@@ -390,38 +647,130 @@ with right_col:
                 st.metric("Score", f"{ev['score']}/10")
             with m2:
                 st.caption("Strengths")
-                _render_typing(st.empty(), ev["strengths"], f"q{idx}_strengths_{hash(ev['strengths'])}", words_per_minute=40)
+                _render_typing(st.empty(), ev["strengths"], f"q{idx}_strengths_{hash(ev['strengths'])}", words_per_minute=600)
             with m3:
                 st.caption("Weaknesses / Missing Points")
                 _render_typing(
                     st.empty(),
                     ev["improvements"],
                     f"q{idx}_improvements_{hash(ev['improvements'])}",
-                    words_per_minute=40,
+                    words_per_minute=600,
                 )
 
-            question_key = f"{interview_role}::{tone_value}::{questions[idx]}"
+            competencies = ev.get("competencies", {})
+            if competencies:
+                _render_competency_radar(
+                    competencies=competencies,
+                    chart_key=f"q{idx}_radar",
+                    title="Competency Radar (This Answer)",
+                )
+
+            question_key = f"{interview_role}::{tone_value}::{persona_value}::{questions[idx]}"
+            interviewer_reply = st.session_state.interviewer_cache.get(question_key, "")
+            if interviewer_reply:
+                st.caption("AI Interviewer")
+                _render_typing(
+                    st.empty(),
+                    interviewer_reply,
+                    f"q{idx}_interviewer_{hash(interviewer_reply)}",
+                    words_per_minute=600,
+                )
+
             with st.expander("AI Reference Answer (Learn from this)", expanded=False):
                 ref = st.session_state.reference_cache.get(question_key, "")
                 if ref:
-                    _render_typing(st.empty(), ref, f"q{idx}_model_{hash(ref)}", words_per_minute=40)
+                    _render_typing(st.empty(), ref, f"q{idx}_model_{hash(ref)}", words_per_minute=600)
                 else:
                     st.caption("Reference answer will appear after you submit this question.")
 
         completed = [x for x in st.session_state.evaluations if x is not None]
         if completed:
             avg = sum(x["score"] for x in completed) / len(completed)
+            avg_comp = {}
+            for dim in COMPETENCY_DIMENSIONS:
+                vals = [float(ev.get("competencies", {}).get(dim, 0)) for ev in completed if ev.get("competencies")]
+                if vals:
+                    avg_comp[dim] = round(sum(vals) / len(vals), 2)
+            benchmark = _percentile_benchmark(interview_role, st.session_state.target_level, avg, avg_comp)
+
             st.markdown(
                 f"""
                 <div class="summary-card">
                     <h4 style="margin:0 0 0.5rem 0;">Final Interview Summary</h4>
                     <p style="margin:0.2rem 0;">Role: <strong>{interview_role}</strong></p>
+                    <p style="margin:0.2rem 0;">Level: <strong>{st.session_state.target_level}</strong></p>
+                    <p style="margin:0.2rem 0;">Interviewer: <strong>{persona_value}</strong> ({st.session_state.interview_tone})</p>
                     <p style="margin:0.2rem 0;">Questions Answered: <strong>{len(completed)}/{len(questions)}</strong></p>
                     <p style="margin:0.2rem 0;">Current Average Score: <strong>{avg:.2f}/10</strong></p>
+                    <p style="margin:0.2rem 0;">Benchmark: <strong>{benchmark['percentile']}th percentile</strong> ({benchmark['band']})</p>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
+
+            if avg_comp:
+                _render_competency_radar(
+                    competencies=avg_comp,
+                    chart_key="final_competency_radar",
+                    title="Competency Radar (Overall)",
+                )
+
+            # Real hiring signal and one-click debrief when the interview round is complete.
+            if len(completed) == len(questions):
+                signal_key = (
+                    f"{interview_role}|{st.session_state.target_level}|{tone_value}|{persona_value}|"
+                    f"{hash(tuple(st.session_state.questions))}|{hash(tuple(st.session_state.answers))}|"
+                    f"{hash(tuple(int(e.get('score', 1)) for e in completed))}"
+                )
+                if signal_key not in st.session_state.hiring_signal_cache:
+                    with st.spinner("Generating hiring signal and debrief report..."):
+                        signal = summarize_hiring_signal(
+                            role=interview_role,
+                            level=st.session_state.target_level,
+                            tone=tone_value,
+                            persona=persona_value,
+                            questions=st.session_state.questions,
+                            answers=st.session_state.answers,
+                            evaluations=st.session_state.evaluations,
+                        )
+                        report = generate_debrief_report(
+                            role=interview_role,
+                            level=st.session_state.target_level,
+                            tone=tone_value,
+                            persona=persona_value,
+                            questions=st.session_state.questions,
+                            answers=st.session_state.answers,
+                            evaluations=st.session_state.evaluations,
+                        )
+                    st.session_state.hiring_signal_cache[signal_key] = signal
+                    st.session_state.debrief_cache[signal_key] = report
+
+                hiring = st.session_state.hiring_signal_cache.get(signal_key, {})
+                if hiring:
+                    st.markdown(
+                        f"""
+                        <div class="summary-card">
+                            <h4 style="margin:0 0 0.5rem 0;">Hiring Signal</h4>
+                            <p style="margin:0.2rem 0;">Decision: <strong>{hiring.get('decision', 'NO_HIRE')}</strong></p>
+                            <p style="margin:0.2rem 0;">{hiring.get('rationale', '')}</p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    evidence = hiring.get("evidence", [])
+                    if isinstance(evidence, list):
+                        for line in evidence[:4]:
+                            st.caption(f"- {line}")
+
+                report_md = st.session_state.debrief_cache.get(signal_key, "")
+                if report_md:
+                    st.download_button(
+                        "Download Debrief Report (.md)",
+                        data=report_md,
+                        file_name=f"interview_debrief_{interview_role.lower().replace(' ', '_')}.md",
+                        mime="text/markdown",
+                        use_container_width=True,
+                    )
 
             if st.button("Retake Interview", use_container_width=True):
                 st.session_state.pending_retake = True
