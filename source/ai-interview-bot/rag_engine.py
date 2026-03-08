@@ -4,24 +4,17 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
-import torch
 from sentence_transformers import SentenceTransformer
 
-try:
-    import faiss  # type: ignore
-    HAS_FAISS = True
-except Exception:
-    HAS_FAISS = False
+import faiss  # type: ignore
+
+from device_utils import get_device
 
 
 @dataclass
 class InterviewQuestion:
     category: str
     text: str
-
-
-def _sbert_device() -> str:
-    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _parse_question_line(row: str) -> InterviewQuestion:
@@ -54,7 +47,7 @@ def _load_questions(file_path: str) -> List[InterviewQuestion]:
 
 @lru_cache(maxsize=1)
 def _get_embedding_model() -> SentenceTransformer:
-    return SentenceTransformer("all-MiniLM-L6-v2", device=_sbert_device())
+    return SentenceTransformer("all-MiniLM-L6-v2", device=get_device())
 
 
 def _l2_normalize(arr: np.ndarray) -> np.ndarray:
@@ -76,20 +69,16 @@ class RAGEngine:
         embeddings = self._model.encode(corpus, convert_to_numpy=True, show_progress_bar=False).astype("float32")
         embeddings = _l2_normalize(embeddings)
 
-        if HAS_FAISS:
-            index = faiss.IndexFlatIP(embeddings.shape[1])
-            index.add(embeddings)
-            self._index = index
+        index = faiss.IndexFlatIP(embeddings.shape[1])
+        index.add(embeddings)
+        self._index = index
         self._embeddings = embeddings
 
     def _search_indices(self, query_vec: np.ndarray, search_k: int) -> np.ndarray:
-        if HAS_FAISS and self._index is not None:
-            _, indices = self._index.search(query_vec, search_k)
-            return indices[0]
-
-        # Numpy fallback when FAISS is unavailable.
-        sims = np.dot(self._embeddings, query_vec[0])
-        return np.argsort(-sims)[:search_k]
+        if self._index is None:
+            raise RuntimeError("FAISS index not initialized")
+        _, indices = self._index.search(query_vec, search_k)
+        return indices[0]
 
     def retrieve_questions(
         self,

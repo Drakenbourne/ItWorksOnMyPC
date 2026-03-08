@@ -1,7 +1,7 @@
 streamlit
 pypdf
-numpy
 torch
-transformers
+transformers<5
 sentence-transformers
-scikit-learn
+faiss-cpu
+numpy

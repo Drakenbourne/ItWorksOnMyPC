@@ -1,23 +1,38 @@
 import json
 import re
 from functools import lru_cache
-from typing import Dict, List
+from typing import Any, Dict, List
 
-import torch
 from transformers import pipeline
+from transformers.pipelines import PIPELINE_REGISTRY
+
+from device_utils import get_device, get_pipeline_device
 
 
-def _pipeline_device() -> int:
-    return 0 if torch.cuda.is_available() else -1
+def _evaluator_task() -> str:
+    supported = set(PIPELINE_REGISTRY.get_supported_tasks())
+    for task in ("text2text-generation", "text-generation"):
+        if task in supported:
+            return task
+    raise RuntimeError("No supported text generation task found in transformers pipeline registry.")
+
+
+def _build_evaluator(device_arg):
+    return pipeline(
+        _evaluator_task(),
+        model="google/flan-t5-base",
+        device=device_arg,
+    )
 
 
 @lru_cache(maxsize=1)
 def _get_evaluator():
-    return pipeline(
-        "text-generation",
-        model="Qwen/Qwen2.5-0.5B-Instruct",
-        device=_pipeline_device(),
-    )
+    if get_device() == "mps":
+        try:
+            return _build_evaluator(get_pipeline_device())
+        except Exception:
+            pass
+    return _build_evaluator(-1)
 
 
 def warmup_evaluator_model() -> None:
@@ -25,25 +40,23 @@ def warmup_evaluator_model() -> None:
     evaluator("Warmup", max_new_tokens=1, do_sample=False)
 
 
-def _extract_generated_text(output_item: Dict[str, str]) -> str:
-    return output_item.get("generated_text") or output_item.get("summary_text") or str(output_item)
+def _extract_generated_text(output_item: Dict[str, Any]) -> str:
+    generated = output_item.get("generated_text") or output_item.get("summary_text") or output_item.get("text")
+    if isinstance(generated, list):
+        if generated and isinstance(generated[-1], dict):
+            return str(generated[-1].get("content") or generated[-1].get("text") or generated[-1])
+        return " ".join(str(item) for item in generated)
+    if generated is not None:
+        return str(generated)
+    return str(output_item)
 
 
-def _run_generation(prompt: str, max_new_tokens: int = 260) -> str:
+def _run_generation(prompt: str, max_new_tokens: int = 60) -> str:
     output_item = _get_evaluator()(prompt, max_new_tokens=max_new_tokens, do_sample=False)[0]
     output = _extract_generated_text(output_item)
     if output.startswith(prompt):
         output = output[len(prompt):].strip()
     return output.strip()
-
-
-def _extract_complete_sentences(text: str, max_sentences: int = 6) -> str:
-    cleaned = re.sub(r"\s+", " ", (text or "").strip())
-    cleaned = cleaned.replace("<", "").replace(">", "")
-    cleaned = re.sub(r"\b(score|strengths|improvements|model_answer)\s*:", "", cleaned, flags=re.IGNORECASE)
-    parts = re.split(r"(?<=[.!?])\s+", cleaned)
-    complete = [p.strip() for p in parts if p.strip() and p.strip()[-1] in ".!?"]
-    return " ".join(complete[:max_sentences]) if complete else ""
 
 
 def _clean_line(text: str, fallback: str) -> str:
@@ -131,56 +144,20 @@ def _build_eval_prompt(question: str, answer: str, role: str) -> str:
     )
 
 
-def _repair_eval_json(raw: str, question: str, answer: str, role: str) -> str:
-    prompt = (
-        "Convert the following content to VALID JSON only with keys score, strengths, improvements.\n"
-        "No markdown. No extra keys.\n\n"
-        f"Role: {role}\nQuestion: {question}\nCandidate Answer: {answer}\n\n"
-        f"Content:\n{raw}\n"
-    )
-    return _run_generation(prompt, max_new_tokens=180)
-
-
-def _generate_reference_answer(question: str, role: str) -> str:
-    prompt = (
-        "You are an expert interview coach.\n"
-        f"Role: {role}\n"
-        f"Question: {question}\n\n"
-        "Write a high-quality reference answer in 4 to 6 COMPLETE sentences. "
-        "Include definition, practical approach, trade-offs, and one concrete example. "
-        "Return only answer text."
-    )
-    raw = _run_generation(prompt, max_new_tokens=280)
-    parsed = _extract_complete_sentences(raw, max_sentences=6)
-    if parsed:
-        return parsed
-    return (
-        "A strong answer should define the concept clearly, then explain an implementation approach with key decisions. "
-        "It should discuss trade-offs such as performance, complexity, and maintainability. "
-        "It should also mention testing and monitoring in production. "
-        "Finally, it should include a practical example with measurable impact."
-    )
-
-
 def evaluate_answer(question: str, answer: str, role: str) -> Dict[str, str]:
     if not answer.strip():
         return {
             "score": 1,
             "strengths": "No strengths detected.",
             "improvements": "Provide a relevant technical answer with clear structure and one concrete example.",
-            "model_answer": _generate_reference_answer(question, role),
         }
 
-    raw = _run_generation(_build_eval_prompt(question, answer, role), max_new_tokens=220)
+    raw = _run_generation(_build_eval_prompt(question, answer, role), max_new_tokens=60)
 
     try:
         parsed_obj = _extract_json_object(raw)
     except Exception:
-        repaired = _repair_eval_json(raw, question, answer, role)
-        try:
-            parsed_obj = _extract_json_object(repaired)
-        except Exception:
-            parsed_obj = _contextual_fallback(question, answer)
+        parsed_obj = _contextual_fallback(question, answer)
 
     score = int(parsed_obj.get("score", 1)) if str(parsed_obj.get("score", "")).isdigit() else 1
     score = max(1, min(10, score))
@@ -195,7 +172,6 @@ def evaluate_answer(question: str, answer: str, role: str) -> Dict[str, str]:
         "score": score,
         "strengths": strengths,
         "improvements": improvements,
-        "model_answer": _generate_reference_answer(question, role),
     }
 
     if any(w in answer.lower() for w in ["fuck", "shit", "bitch", "asshole"]):

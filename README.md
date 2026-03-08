@@ -5,14 +5,15 @@ This project is an AI-powered Interview Preparation Bot built with a Retrieval A
 ## Features
 
 - Resume upload (`PDF`) and text extraction using `PyPDF`
-- Technical skill extraction using a HuggingFace `transformers` model
+- Fast technical skill extraction using keyword matching
 - RAG-based interview question retrieval using:
   - `sentence-transformers` (`all-MiniLM-L6-v2`)
   - `FAISS` vector database
 - Interactive interview mode (question by question)
-- Answer evaluation using a HuggingFace model
+- Answer evaluation using `google/flan-t5-base`
 - Final interview score summary
 - Streamlit UI for end-to-end workflow
+- Apple Silicon Metal (`MPS`) support for PyTorch-backed models
 
 ## Project Structure
 
@@ -35,15 +36,18 @@ ItWorksOnMyPC/
 ## Run Locally
 
 1. Open terminal in `source/ai-interview-bot`
-2. Install dependencies:
+2. Create and activate virtual environment:
+   - `python3 -m venv .venv`
+   - `source .venv/bin/activate`
+3. Install dependencies:
    - `pip install -r requirements.txt`
-3. Start app:
+4. Start app:
    - `streamlit run app.py`
 
 ## Notes
 
 - First run downloads model weights, so startup may take longer.
-- CPU execution is supported; GPU is optional.
+- On Apple Silicon Macs, models use Metal GPU (`MPS`) when available.
 - https://aiinterviewprep.streamlit.app/
 
 ## Deployment (Railway / Fly.io)

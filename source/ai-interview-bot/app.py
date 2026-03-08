@@ -3,8 +3,8 @@ from pathlib import Path
 from typing import List
 
 import streamlit as st
-import torch
 
+from device_utils import get_device
 from llm_utils import evaluate_answer, warmup_evaluator_model
 from rag_engine import get_rag_engine, warmup_rag_system
 from resume_parser import extract_skills, extract_text_from_pdf, warmup_skill_extractor
@@ -150,9 +150,9 @@ if not st.session_state.runtime_ready:
     progress = st.progress(0)
     status = st.empty()
     steps = [
-        ("Loading skill extraction model...", warmup_skill_extractor),
+        ("Preparing keyword skill extraction...", warmup_skill_extractor),
         ("Loading embedding model and building FAISS index...", lambda: warmup_rag_system(str(DATA_FILE))),
-        ("Loading answer evaluator model...", warmup_evaluator_model),
+        ("Loading FLAN-T5 answer evaluator...", warmup_evaluator_model),
     ]
 
     try:
@@ -170,7 +170,7 @@ if not st.session_state.runtime_ready:
     st.session_state.runtime_ready = True
     st.rerun()
 
-runtime_device = "GPU" if torch.cuda.is_available() else "CPU"
+runtime_device = get_device().upper()
 st.markdown(
     f"""
     <div class="hero">
@@ -207,7 +207,7 @@ with left_col:
         if not st.session_state.resume_text:
             st.warning("Upload a resume first.")
         else:
-            with st.spinner("Extracting skills using HuggingFace model..."):
+            with st.spinner("Extracting skills using keyword matching..."):
                 st.session_state.skills = extract_skills(st.session_state.resume_text)
 
     if st.session_state.skills:
