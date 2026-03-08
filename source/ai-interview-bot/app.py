@@ -6,13 +6,14 @@ import streamlit as st
 
 from device_utils import get_device
 from llm_utils import (
+    analyze_candidate_profile,
     evaluate_answer,
     generate_reference_answer,
     get_evaluator_backend_label,
     warmup_evaluator_model,
 )
 from rag_engine import get_rag_engine, warmup_rag_system
-from resume_parser import extract_skills, extract_text_from_pdf, warmup_skill_extractor
+from resume_parser import extract_text_from_upload
 
 
 st.set_page_config(page_title="AI Interview Preparation Bot", page_icon=":dart:", layout="wide")
@@ -37,6 +38,8 @@ st.markdown(
 
 DATA_FILE = Path(__file__).parent / "data" / "interview_questions.txt"
 ROLES = ["Backend", "AI Engineer", "Data Scientist", "Fullstack"]
+ROLE_MODES = ["Select Role", "Infer From Job Description"]
+INTERVIEW_TONES = ["Easy", "Medium", "Strict"]
 
 ROLE_CATEGORY_HINTS = {
     "Backend": ["Backend Development", "System Design", "Software Engineering"],
@@ -58,7 +61,12 @@ FULLSTACK_BLOCKLIST = {"machine learning", "deep learning", "nlp", "pytorch", "t
 for key, default in {
     "runtime_ready": False,
     "resume_text": "",
+    "jd_text": "",
     "skills": [],
+    "analysis_done": False,
+    "analysis_role": "",
+    "analysis_focus": "",
+    "interview_role": "",
     "questions": [],
     "question_sources": [],
     "current_index": 0,
@@ -72,6 +80,8 @@ for key, default in {
     "pending_retake_count": 6,
     "typed_done": {},
     "reference_cache": {},
+    "interview_tone": "Medium",
+    "role_mode": ROLE_MODES[0],
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -79,7 +89,13 @@ for key, default in {
 evaluator_backend = get_evaluator_backend_label()
 
 
-def _render_typing(container, text: str, anim_key: str, delay: float = 0.012) -> None:
+def _render_typing(
+    container,
+    text: str,
+    anim_key: str,
+    words_per_minute: int = 40,
+    max_duration_sec: float = 12.0,
+) -> None:
     text = (text or "").strip()
     if not text:
         return
@@ -89,11 +105,16 @@ def _render_typing(container, text: str, anim_key: str, delay: float = 0.012) ->
         container.write(text)
         return
 
-    words = text.split(" ")
-    current = ""
-    for word in words:
-        current = (current + " " + word).strip()
-        container.write(current)
+    chars_per_second = max(1.0, (words_per_minute * 5) / 60.0)
+    total_chars = len(text)
+    chunk_size = 1
+    estimated_duration = total_chars / chars_per_second
+    if estimated_duration > max_duration_sec:
+        chunk_size = max(1, int(total_chars / (chars_per_second * max_duration_sec)))
+    delay = max(0.01, chunk_size / chars_per_second)
+
+    for i in range(0, total_chars, chunk_size):
+        container.write(text[: i + chunk_size])
         time.sleep(delay)
 
     typed_done[anim_key] = True
@@ -112,11 +133,20 @@ def _filter_skills_for_role(skills: List[str], role: str) -> List[str]:
     return filtered
 
 
-def _start_interview(role: str, count: int) -> None:
+def _start_interview(role: str, count: int, jd_context: str = "") -> None:
     rag_engine = get_rag_engine(str(DATA_FILE))
     filtered_skills = _filter_skills_for_role(st.session_state.skills, role)
     skill_query = ", ".join(filtered_skills[:8])
-    retrieval_query = f"Role: {role}. Skills: {skill_query}" if skill_query else f"Role: {role}"
+    jd_query = (jd_context or "").strip()
+    if len(jd_query) > 800:
+        jd_query = jd_query[:800]
+
+    query_parts = [f"Role: {role}"]
+    if skill_query:
+        query_parts.append(f"Skills: {skill_query}")
+    if jd_query:
+        query_parts.append(f"Job Description Context: {jd_query}")
+    retrieval_query = ". ".join(query_parts)
 
     questions = rag_engine.retrieve_questions(
         retrieval_query,
@@ -126,6 +156,7 @@ def _start_interview(role: str, count: int) -> None:
 
     st.session_state.questions = questions
     st.session_state.question_sources = ["RAG"] * len(questions)
+    st.session_state.interview_role = role
     st.session_state.current_index = 0
     st.session_state.active_question_index = 0
     st.session_state.current_answer_input = ""
@@ -159,7 +190,6 @@ if not st.session_state.runtime_ready:
     progress = st.progress(0)
     status = st.empty()
     steps = [
-        ("Preparing keyword skill extraction...", warmup_skill_extractor),
         ("Loading embedding model and building FAISS index...", lambda: warmup_rag_system(str(DATA_FILE))),
         (f"Loading evaluator backend: {evaluator_backend}...", warmup_evaluator_model),
     ]
@@ -187,7 +217,7 @@ st.markdown(
             <span class="runtime-chip">Runtime: {runtime_device}</span>
             <span class="runtime-chip">Evaluator: {evaluator_backend}</span>
         </h2>
-        <p style="margin:0.4rem 0 0 0;">Hackathon demo: Resume-aware skill extraction + role-aware RAG + AI answer evaluation</p>
+        <p style="margin:0.4rem 0 0 0;">Resume + JD aware role inference, tone-controlled interviewing, and AI-grounded evaluation.</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -195,10 +225,10 @@ st.markdown(
 
 st.markdown(
     """
-    <span class="step-chip">1. Upload Resume</span>
-    <span class="step-chip">2. Extract Skills</span>
+    <span class="step-chip">1. Resume + Optional JD</span>
+    <span class="step-chip">2. AI Profile Analysis</span>
     <span class="step-chip">3. Retrieve Questions (RAG)</span>
-    <span class="step-chip">4. Answer + Evaluate</span>
+    <span class="step-chip">4. Answer + Tone-based Evaluation</span>
     """,
     unsafe_allow_html=True,
 )
@@ -207,39 +237,88 @@ left_col, right_col = st.columns([1, 2], gap="large")
 
 with left_col:
     st.subheader("Workflow")
-    selected_role = st.selectbox("Target Role", ROLES)
+    role_mode = st.radio("Interview Setup", ROLE_MODES, key="role_mode", horizontal=True)
+    manual_role = st.selectbox("Target Role", ROLES, key="manual_role", disabled=role_mode != ROLE_MODES[0])
+    st.select_slider("Interviewer Tone", options=INTERVIEW_TONES, key="interview_tone")
     question_count = st.slider("Number of Questions", min_value=3, max_value=12, value=6)
-    uploaded_file = st.file_uploader("Step 1: Upload Resume (PDF)", type=["pdf"])
+    uploaded_file = st.file_uploader("Step 1: Upload Resume (PDF/TXT)", type=["pdf", "txt"])
+    jd_uploaded_file = st.file_uploader("Optional: Upload Job Description (PDF/TXT)", type=["pdf", "txt"])
+    jd_pasted = st.text_area(
+        "Or paste Job Description text",
+        value=st.session_state.jd_text,
+        height=120,
+        placeholder="Paste JD text here if you don't upload a JD file...",
+    )
 
     if uploaded_file is not None:
         with st.spinner("Parsing resume..."):
-            st.session_state.resume_text = extract_text_from_pdf(uploaded_file)
+            st.session_state.resume_text = extract_text_from_upload(uploaded_file)
 
-    if st.button("Step 2: Extract Skills", use_container_width=True):
+    if jd_uploaded_file is not None:
+        with st.spinner("Parsing job description..."):
+            st.session_state.jd_text = extract_text_from_upload(jd_uploaded_file)
+    elif jd_pasted.strip():
+        st.session_state.jd_text = jd_pasted.strip()
+
+    if st.button("Step 2: Analyze Role + Skills", use_container_width=True):
         if not st.session_state.resume_text:
             st.warning("Upload a resume first.")
+        elif role_mode == ROLE_MODES[1] and not st.session_state.jd_text.strip():
+            st.warning("Upload or paste a job description to infer role from JD.")
         else:
-            with st.spinner("Extracting skills using keyword matching..."):
-                st.session_state.skills = extract_skills(st.session_state.resume_text)
+            selected_for_analysis = manual_role if role_mode == ROLE_MODES[0] else ""
+            with st.spinner("AI is analyzing resume and job context..."):
+                analysis = analyze_candidate_profile(
+                    resume_text=st.session_state.resume_text,
+                    job_description=st.session_state.jd_text,
+                    selected_role=selected_for_analysis,
+                )
+            st.session_state.skills = analysis.get("skills", [])
+            st.session_state.analysis_role = analysis.get("role", manual_role)
+            st.session_state.analysis_focus = analysis.get("jd_focus", "")
+            st.session_state.analysis_done = True
+
+    if st.session_state.analysis_done:
+        st.success("Profile analyzed")
+        st.write(f"Role for interview: **{st.session_state.analysis_role or manual_role}**")
+        if st.session_state.analysis_focus:
+            _render_typing(
+                st.empty(),
+                f"JD focus: {st.session_state.analysis_focus}",
+                f"focus_{hash(st.session_state.analysis_focus)}",
+                words_per_minute=40,
+            )
 
     if st.session_state.skills:
-        st.success("Skills extracted")
         skill_summary = ", ".join(st.session_state.skills)
-        _render_typing(st.empty(), f"Detected skills: {skill_summary}", f"skills_{hash(skill_summary)}", delay=0.01)
+        _render_typing(
+            st.empty(),
+            f"AI-detected skills: {skill_summary}",
+            f"skills_{hash(skill_summary)}",
+            words_per_minute=40,
+        )
 
     if st.button("Step 3: Start Interview", use_container_width=True):
-        _start_interview(selected_role, question_count)
-        st.rerun()
+        if not st.session_state.analysis_done:
+            st.warning("Run Step 2 first so AI can set interview role and skills.")
+        else:
+            role_for_interview = st.session_state.analysis_role or manual_role
+            _start_interview(role_for_interview, question_count, jd_context=st.session_state.jd_text)
+            st.rerun()
+
+selected_role = st.session_state.analysis_role or st.session_state.get("manual_role", ROLES[0])
 
 if st.session_state.pending_retake:
     role = st.session_state.pending_retake_role or selected_role
     count = int(st.session_state.pending_retake_count or question_count)
     st.session_state.pending_retake = False
-    _start_interview(role, count)
+    _start_interview(role, count, jd_context=st.session_state.jd_text)
     st.rerun()
 
 with right_col:
     st.subheader("Interview Panel")
+    tone_value = (st.session_state.interview_tone or "Medium").strip().lower()
+    interview_role = st.session_state.interview_role or selected_role
 
     if not st.session_state.interview_started:
         st.info("Complete steps on the left to begin interview mode.")
@@ -259,6 +338,7 @@ with right_col:
             f"""
             <div class="question-card">
                 <div class="question-source">Source: [{source_label}]</div>
+                <div class="question-source">Interviewer tone: [{st.session_state.interview_tone}]</div>
                 <div><strong>{questions[idx]}</strong></div>
             </div>
             """,
@@ -276,12 +356,21 @@ with right_col:
         with c1:
             if st.button("Submit Answer", use_container_width=True):
                 st.session_state.answers[idx] = st.session_state.current_answer_input
-                question_key = f"{selected_role}::{questions[idx]}"
+                question_key = f"{interview_role}::{tone_value}::{questions[idx]}"
                 with st.spinner(
                     f"AI interviewer reviewing your answer and preparing reference via {evaluator_backend}..."
                 ):
-                    evaluation = evaluate_answer(questions[idx], st.session_state.current_answer_input, selected_role)
-                    st.session_state.reference_cache[question_key] = generate_reference_answer(questions[idx], selected_role)
+                    evaluation = evaluate_answer(
+                        questions[idx],
+                        st.session_state.current_answer_input,
+                        interview_role,
+                        tone=tone_value,
+                    )
+                    st.session_state.reference_cache[question_key] = generate_reference_answer(
+                        questions[idx],
+                        interview_role,
+                        tone=tone_value,
+                    )
                 st.session_state.evaluations[idx] = evaluation
                 st.rerun()
 
@@ -301,16 +390,21 @@ with right_col:
                 st.metric("Score", f"{ev['score']}/10")
             with m2:
                 st.caption("Strengths")
-                _render_typing(st.empty(), ev["strengths"], f"q{idx}_strengths_{hash(ev['strengths'])}")
+                _render_typing(st.empty(), ev["strengths"], f"q{idx}_strengths_{hash(ev['strengths'])}", words_per_minute=40)
             with m3:
                 st.caption("Weaknesses / Missing Points")
-                _render_typing(st.empty(), ev["improvements"], f"q{idx}_improvements_{hash(ev['improvements'])}")
+                _render_typing(
+                    st.empty(),
+                    ev["improvements"],
+                    f"q{idx}_improvements_{hash(ev['improvements'])}",
+                    words_per_minute=40,
+                )
 
-            question_key = f"{selected_role}::{questions[idx]}"
+            question_key = f"{interview_role}::{tone_value}::{questions[idx]}"
             with st.expander("AI Reference Answer (Learn from this)", expanded=False):
                 ref = st.session_state.reference_cache.get(question_key, "")
                 if ref:
-                    _render_typing(st.empty(), ref, f"q{idx}_model_{hash(ref)}", delay=0.008)
+                    _render_typing(st.empty(), ref, f"q{idx}_model_{hash(ref)}", words_per_minute=40)
                 else:
                     st.caption("Reference answer will appear after you submit this question.")
 
@@ -321,7 +415,7 @@ with right_col:
                 f"""
                 <div class="summary-card">
                     <h4 style="margin:0 0 0.5rem 0;">Final Interview Summary</h4>
-                    <p style="margin:0.2rem 0;">Role: <strong>{selected_role}</strong></p>
+                    <p style="margin:0.2rem 0;">Role: <strong>{interview_role}</strong></p>
                     <p style="margin:0.2rem 0;">Questions Answered: <strong>{len(completed)}/{len(questions)}</strong></p>
                     <p style="margin:0.2rem 0;">Current Average Score: <strong>{avg:.2f}/10</strong></p>
                 </div>
@@ -331,6 +425,6 @@ with right_col:
 
             if st.button("Retake Interview", use_container_width=True):
                 st.session_state.pending_retake = True
-                st.session_state.pending_retake_role = selected_role
+                st.session_state.pending_retake_role = interview_role
                 st.session_state.pending_retake_count = question_count
                 st.rerun()

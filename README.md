@@ -5,11 +5,14 @@ This project is an AI-powered Interview Preparation Bot built with a Retrieval A
 ## Features
 
 - Resume upload (`PDF`) and text extraction using `PyPDF`
-- Fast technical skill extraction using keyword matching
+- AI profile analysis from resume + optional job description:
+  - infer role automatically from JD, or use manual role selection
+  - infer technical skills using LLM extraction
 - RAG-based interview question retrieval using:
   - `sentence-transformers` (`all-MiniLM-L6-v2`)
   - `FAISS` vector database
 - Interactive interview mode (question by question)
+- Interviewer tone controls: `Easy`, `Medium`, `Strict`
 - Answer evaluation with provider switch:
   - Local Hugging Face (`Qwen/Qwen2.5-0.5B-Instruct` by default)
   - Puter Gemini bridge (`google/gemini-2.5-flash-lite` by default)
@@ -70,6 +73,7 @@ Run these in `source/ai-interview-bot`:
 - First run downloads model weights, so startup may take longer.
 - On Apple Silicon Macs, models use Metal GPU (`MPS`) when available.
 - For Puter Gemini mode, RAG/embeddings still run locally; evaluator/reference generation run via Puter.
+- Typing animation for AI outputs is enabled in the UI.
 - https://aiinterviewprep.streamlit.app/
 
 ## Deployment (Railway / Fly.io)

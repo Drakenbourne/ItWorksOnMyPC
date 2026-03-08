@@ -1,29 +1,9 @@
-import re
-from typing import List
+from typing import Optional
 
 from pypdf import PdfReader
 
-KNOWN_SKILLS = [
-    "python",
-    "machine learning",
-    "deep learning",
-    "pytorch",
-    "tensorflow",
-    "sql",
-    "docker",
-    "kubernetes",
-    "aws",
-    "react",
-    "node",
-]
-
-SKILL_ALIASES = {
-    "node": ["node", "node.js", "nodejs"],
-}
-
-
 def warmup_skill_extractor() -> None:
-    """Keyword extraction does not require model warmup."""
+    """Profile parsing does not require model warmup."""
     return None
 
 
@@ -33,25 +13,30 @@ def extract_text_from_pdf(uploaded_file) -> str:
     return "\n".join(pages).strip()
 
 
-def _compact_whitespace(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip().lower()
+def extract_text_from_upload(uploaded_file) -> str:
+    if uploaded_file is None:
+        return ""
+
+    file_name = (uploaded_file.name or "").lower()
+    file_type = (uploaded_file.type or "").lower()
+    if file_name.endswith(".pdf") or "pdf" in file_type:
+        return extract_text_from_pdf(uploaded_file)
+
+    try:
+        raw = uploaded_file.getvalue()
+    except Exception:
+        raw = b""
+    if not raw:
+        return ""
+
+    for encoding in ("utf-8", "latin-1", "utf-16"):
+        try:
+            return raw.decode(encoding, errors="ignore").strip()
+        except Exception:
+            continue
+    return ""
 
 
-def _contains_skill(text: str, skill: str) -> bool:
-    aliases = SKILL_ALIASES.get(skill, [skill])
-    for alias in aliases:
-        pattern = r"\b" + re.escape(alias) + r"\b"
-        if re.search(pattern, text):
-            return True
-    return False
-
-
-def _keyword_skill_extract(cleaned_text: str, top_k: int) -> List[str]:
-    return [skill for skill in KNOWN_SKILLS if _contains_skill(cleaned_text, skill)][:top_k]
-
-
-def extract_skills(resume_text: str, top_k: int = 12) -> List[str]:
-    cleaned_text = _compact_whitespace(resume_text)
-    if not cleaned_text:
-        return []
-    return _keyword_skill_extract(cleaned_text, top_k=top_k)
+def extract_text_from_optional_upload(uploaded_file) -> Optional[str]:
+    text = extract_text_from_upload(uploaded_file)
+    return text if text else None

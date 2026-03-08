@@ -18,6 +18,9 @@ DEFAULT_PUTER_MODEL = os.getenv("PUTER_MODEL", "google/gemini-2.5-flash-lite")
 PUTER_AUTH_TOKEN_ENV = "PUTER_AUTH_TOKEN"
 PUTER_TIMEOUT_SECONDS = int(os.getenv("PUTER_TIMEOUT_SECONDS", "120"))
 PUTER_BRIDGE_PATH = Path(__file__).with_name("puter_bridge.js")
+KNOWN_ROLES = ["Backend", "AI Engineer", "Data Scientist", "Fullstack"]
+TONE_LABELS = {"easy": "Easy", "medium": "Medium", "strict": "Strict"}
+TONE_SCORE_BIAS = {"easy": 1, "medium": 0, "strict": -1}
 
 
 def get_evaluator_provider() -> str:
@@ -208,6 +211,92 @@ def _coerce_score(value: Any) -> int:
     return int(match.group(1))
 
 
+def _normalize_tone(tone: str) -> str:
+    t = (tone or "").strip().lower()
+    if t in TONE_LABELS:
+        return t
+    return "medium"
+
+
+def _normalize_role_name(role_value: Any, fallback: str = "Backend") -> str:
+    raw = str(role_value or "").strip().lower()
+    if not raw:
+        return fallback
+    alias_map = {
+        "backend": "Backend",
+        "backend engineer": "Backend",
+        "software engineer": "Backend",
+        "ai engineer": "AI Engineer",
+        "ml engineer": "AI Engineer",
+        "machine learning engineer": "AI Engineer",
+        "data scientist": "Data Scientist",
+        "data science": "Data Scientist",
+        "fullstack": "Fullstack",
+        "full stack": "Fullstack",
+        "full-stack": "Fullstack",
+    }
+    if raw in alias_map:
+        return alias_map[raw]
+    for known in KNOWN_ROLES:
+        if known.lower() in raw:
+            return known
+    return fallback
+
+
+def _coerce_skill_list(value: Any, top_k: int = 12) -> List[str]:
+    items: List[str] = []
+    if isinstance(value, list):
+        items = [str(x).strip() for x in value]
+    elif isinstance(value, str):
+        items = [x.strip() for x in re.split(r"[,;\n]+", value)]
+
+    cleaned: List[str] = []
+    seen = set()
+    for item in items:
+        skill = re.sub(r"\s+", " ", item).strip().lower()
+        if not skill or len(skill) < 2:
+            continue
+        if skill in seen:
+            continue
+        seen.add(skill)
+        cleaned.append(skill)
+        if len(cleaned) >= top_k:
+            break
+    return cleaned
+
+
+def _heuristic_role_from_text(job_desc: str, resume_text: str, fallback: str = "Backend") -> str:
+    text = f"{job_desc}\n{resume_text}".lower()
+    if any(k in text for k in ["pytorch", "tensorflow", "llm", "nlp", "mlops"]):
+        return "AI Engineer"
+    if any(k in text for k in ["hypothesis", "statistics", "ab test", "eda", "regression"]):
+        return "Data Scientist"
+    if any(k in text for k in ["react", "frontend", "full stack", "typescript", "next.js"]):
+        return "Fullstack"
+    return fallback
+
+
+def _heuristic_skills(text: str, top_k: int = 12) -> List[str]:
+    candidates = re.findall(r"\b[a-zA-Z][a-zA-Z0-9+.#/\-]{1,24}\b", text or "")
+    preferred = {
+        "python", "java", "go", "rust", "c++", "pytorch", "tensorflow", "sql", "postgres",
+        "mongodb", "redis", "docker", "kubernetes", "aws", "gcp", "azure", "spark", "hadoop",
+        "react", "node", "node.js", "typescript", "javascript", "fastapi", "django", "flask",
+        "llm", "mlops", "airflow", "kafka", "faiss", "numpy", "pandas", "scikit", "xgboost",
+    }
+    out: List[str] = []
+    seen = set()
+    for token in candidates:
+        t = token.lower()
+        if t not in preferred or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= top_k:
+            break
+    return out
+
+
 def _tokenize(text: str) -> List[str]:
     return re.findall(r"[a-zA-Z][a-zA-Z0-9+\-]*", (text or "").lower())
 
@@ -357,6 +446,52 @@ def _extract_json_block(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def analyze_candidate_profile(resume_text: str, job_description: str, selected_role: str = "") -> Dict[str, Any]:
+    safe_resume = (resume_text or "").strip()
+    safe_jd = (job_description or "").strip()
+    manual_role = _normalize_role_name(selected_role, fallback="Backend") if selected_role else ""
+    fallback_role = manual_role or _heuristic_role_from_text(safe_jd, safe_resume, fallback="Backend")
+
+    prompt = (
+        "Analyze the candidate profile for technical interview preparation.\n"
+        "Use resume and job description context to infer the best interview role and strongest technical skills.\n"
+        "Return strict JSON only with keys: role, skills, jd_focus.\n"
+        "- role must be one of: Backend, AI Engineer, Data Scientist, Fullstack\n"
+        "- skills must be a list of 6 to 12 lowercase technical skills relevant to the role\n"
+        "- jd_focus must be one short sentence summarizing what the job description emphasizes\n\n"
+        f"Manual role override (empty means infer from JD): {selected_role}\n"
+        f"Job Description:\n{safe_jd or '[none provided]'}\n\n"
+        f"Resume:\n{safe_resume[:6000]}"
+    )
+
+    parsed: Optional[Dict[str, Any]] = None
+    try:
+        raw = _run_chat(
+            system_prompt="You are an expert technical recruiter and hiring manager.",
+            user_prompt=prompt,
+            max_new_tokens=300,
+        )
+        parsed = _extract_json_block(raw)
+    except Exception:
+        parsed = None
+
+    if parsed:
+        role = _normalize_role_name(parsed.get("role"), fallback=fallback_role)
+        if selected_role:
+            role = manual_role
+        skills = _coerce_skill_list(parsed.get("skills"), top_k=12)
+        if not skills:
+            skills = _heuristic_skills(f"{safe_resume}\n{safe_jd}", top_k=12)
+        jd_focus = _normalize_line(parsed.get("jd_focus") or "Interview focus generated from resume and role context.")
+        return {"role": role, "skills": skills, "jd_focus": jd_focus}
+
+    return {
+        "role": fallback_role,
+        "skills": _heuristic_skills(f"{safe_resume}\n{safe_jd}", top_k=12),
+        "jd_focus": "Interview focus inferred from available profile context.",
+    }
+
+
 def _looks_grounded_feedback(feedback: str, question: str, answer: str) -> bool:
     text = (feedback or "").strip().lower()
     if not text:
@@ -369,7 +504,14 @@ def _looks_grounded_feedback(feedback: str, question: str, answer: str) -> bool:
     return len(f_tokens.intersection(a_tokens.union(q_tokens))) >= 2
 
 
-def _evaluate_with_model(question: str, answer: str, role: str) -> Optional[Dict[str, str]]:
+def _evaluate_with_model(question: str, answer: str, role: str, tone: str) -> Optional[Dict[str, str]]:
+    tone_value = _normalize_tone(tone)
+    tone_instruction = {
+        "easy": "Be supportive and coaching-oriented while staying truthful to the answer.",
+        "medium": "Be balanced and interview-realistic.",
+        "strict": "Be demanding and rigorous; expect depth, trade-offs, and concrete technical detail.",
+    }[tone_value]
+
     prompt = (
         "Evaluate the candidate answer for this interview question.\n"
         "Use only evidence present in the candidate answer. Do not invent claims.\n"
@@ -379,6 +521,7 @@ def _evaluate_with_model(question: str, answer: str, role: str) -> Optional[Dict
         "- strengths: one concise sentence about what the candidate actually did well\n"
         "- improvements: one concise sentence on what is missing or can be improved\n"
         "- If answer is abusive/off-topic/very low-quality, set score <= 2 and reflect that clearly.\n\n"
+        f"Interviewer tone: {TONE_LABELS[tone_value]} ({tone_instruction})\n"
         f"Role: {role}\n"
         f"Question: {question}\n"
         f"Candidate answer: {answer}\n"
@@ -398,11 +541,19 @@ def _evaluate_with_model(question: str, answer: str, role: str) -> Optional[Dict
     }
 
 
-def _final_score(question: str, answer: str, strength: str, model_score: Optional[int] = None) -> int:
+def _final_score(
+    question: str,
+    answer: str,
+    strength: str,
+    tone: str,
+    model_score: Optional[int] = None,
+) -> int:
+    tone_value = _normalize_tone(tone)
     heuristic = _heuristic_score(question, answer)
     score = heuristic if model_score is None else model_score
     if model_score is not None:
         score = max(heuristic - 2, min(heuristic + 2, model_score))
+    score += TONE_SCORE_BIAS[tone_value]
     if strength.lower().startswith("no clear technical strength"):
         score = min(score, 4)
     if _is_profane(answer):
@@ -412,15 +563,16 @@ def _final_score(question: str, answer: str, strength: str, model_score: Optiona
     return max(1, min(10, score))
 
 
-def evaluate_answer(question: str, answer: str, role: str) -> Dict[str, str]:
+def evaluate_answer(question: str, answer: str, role: str, tone: str = "medium") -> Dict[str, str]:
     safe_answer = (answer or "").strip() or "No candidate answer provided."
+    tone_value = _normalize_tone(tone)
 
     heuristic_strength = _normalize_line(_derive_strength(question, safe_answer))
     heuristic_weakness = _normalize_line(_derive_weakness(question, safe_answer))
 
     model_eval: Optional[Dict[str, str]] = None
     try:
-        model_eval = _evaluate_with_model(question, safe_answer, role)
+        model_eval = _evaluate_with_model(question, safe_answer, role, tone=tone_value)
     except Exception:
         model_eval = None
 
@@ -439,16 +591,24 @@ def evaluate_answer(question: str, answer: str, role: str) -> Dict[str, str]:
 
         model_score = _coerce_score(model_eval.get("score"))
 
-    final_score = _final_score(question, safe_answer, strengths, model_score=model_score)
+    final_score = _final_score(question, safe_answer, strengths, tone=tone_value, model_score=model_score)
     return {"score": final_score, "strengths": strengths, "improvements": improvements}
 
 
 @lru_cache(maxsize=512)
-def generate_reference_answer(question: str, role: str) -> str:
+def generate_reference_answer(question: str, role: str, tone: str = "medium") -> str:
+    tone_value = _normalize_tone(tone)
+    tone_instruction = {
+        "easy": "Keep wording approachable but still technical.",
+        "medium": "Keep wording balanced and interview-ready.",
+        "strict": "Make it highly rigorous with implementation specifics and trade-offs.",
+    }[tone_value]
+
     answer = _run_chat(
         system_prompt="You are a candidate in a technical interview. Answer directly and clearly.",
         user_prompt=(
             f"Role: {role}\n"
+            f"Interviewer tone: {TONE_LABELS[tone_value]} ({tone_instruction})\n"
             f"Question: {question}\n\n"
             "Provide the best candidate answer in 5 to 7 complete sentences.\n"
             "Write in first-person interview style, technically detailed, coherent, and concise.\n"
